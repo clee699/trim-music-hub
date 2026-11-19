@@ -1,0 +1,15 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common"
+
+log_info "Running install_init..."
+check_docker_ready
+
+if ! detect_fnos_db_dir >/dev/null 2>&1; then
+  fail_with_msg "未检测到飞牛音乐（trim.music）数据目录，请先在应用中心安装并打开一次「飞牛音乐」完成初始化。"
+fi
+
+load_saved_config
+check_port_conflict "${CFG_PORT}"
+exit 0

@@ -1,16 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
-import type { PlaylistPreview, PlaylistPreviewTrack } from '@/types';
+import type { PlaylistPreview, PlaylistPreviewTrack, CurrentUser } from '@/types';
 import { api } from '@/api';
 import { showToast } from '@/composables/useToast';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { ArrowLeft, Check, Loader2, Music2, RefreshCw, AlertCircle } from 'lucide-vue-next';
 
-type QualityType = 'flac' | '320k' | '128k' | string;
-type SourceType = 'auto' | 'tx' | 'wy' | 'kw' | 'kg';
+type SourceType = 'auto' | 'tx' | 'wy' | 'kw' | 'kg' | 'custom';
 
 interface Props {
   url: string;
@@ -22,6 +22,7 @@ interface Props {
   userList?: Array<{ id: number; name: string }>;
   initialPreview?: PlaylistPreview | null;
   showBackButton?: boolean;
+  currentUser?: CurrentUser | null;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -33,6 +34,7 @@ const props = withDefaults(defineProps<Props>(), {
   userList: () => [],
   initialPreview: null,
   showBackButton: true,
+  currentUser: null,
 });
 
 const emit = defineEmits<{
@@ -45,18 +47,25 @@ const preview = ref<PlaylistPreview | null>(props.initialPreview || null);
 const selectedIndexes = ref<number[]>([]);
 const playlistName = ref(props.initialPlaylistName || '');
 const resolvedAccountUser = ref(props.defaultTargetUser || '');
+const failedPlaylistCover = ref(false);
+const failedTrackCovers = ref<Set<number>>(new Set());
+let qualityProbeSeq = 0;
 
 // 优先读取云端账号绑定的飞牛用户
 const boundUserName = computed(() => {
   return preview.value?.matched_account?.owner_user || props.defaultTargetUser || resolvedAccountUser.value || '';
 });
 
+const isAdmin = computed(() => props.currentUser ? Boolean(props.currentUser.isAdmin) : true);
+
 const targetType = ref<'public' | 'user'>(
-  props.defaultTargetType
-    ? props.defaultTargetType
-    : (props.defaultTargetUser || props.accountId ? 'user' : 'public')
+  !isAdmin.value
+    ? 'user'
+    : props.defaultTargetType
+      ? props.defaultTargetType
+      : (props.defaultTargetUser || props.accountId ? 'user' : 'public')
 );
-const targetUser = ref(props.defaultTargetUser || '');
+const targetUser = ref(props.defaultTargetUser || props.currentUser?.username || '');
 const parsing = ref(false);
 const parseError = ref('');
 const starting = ref(false);
@@ -80,6 +89,12 @@ const selectedCount = computed(() => selectedIndexes.value.length);
 const allSelected = computed(() => !!preview.value && preview.value.tracks.length > 0 && selectedCount.value === preview.value.tracks.length);
 const reusedCount = computed(() => preview.value?.tracks.filter(t => t.exists).length || 0);
 const selectedTracks = computed(() => preview.value?.tracks.filter(track => selectedIndexes.value.includes(track.index)) || []);
+
+function markTrackCoverFailed(idx: number) {
+  const next = new Set(failedTrackCovers.value);
+  next.add(idx);
+  failedTrackCovers.value = next;
+}
 
 // 动态汇总所有未收录单曲在当前音源下支持的可选品质
 const availableGlobalQualities = computed(() => {
@@ -128,7 +143,7 @@ function getTrackQuality(track: PlaylistPreviewTrack): string {
   if (quals.includes(globalQuality.value)) {
     return globalQuality.value;
   }
-  if (globalQuality.value === 'flac') {
+  if (globalQuality.value === 'flac' || globalQuality.value === 'flac24bit') {
     return quals[0] || 'flac';
   }
   if (quals.includes('320k')) return '320k';
@@ -171,7 +186,11 @@ function toggleAll(checked: boolean | 'indeterminate') {
 async function handleSourceChange(newSource: any) {
   const src = String(newSource) as SourceType;
   selectedSource.value = src;
-  if (!preview.value?.tracks?.length) return;
+  const seq = ++qualityProbeSeq;
+  if (!preview.value?.tracks?.length) {
+    queryingQualities.value = false;
+    return;
+  }
 
   const tracksToProbe = preview.value.tracks.map(t => ({
     index: t.index,
@@ -183,7 +202,8 @@ async function handleSourceChange(newSource: any) {
   queryingQualities.value = true;
   try {
     const res = await api.querySourceQualities(src, tracksToProbe);
-    if (res.ok && Array.isArray(res.data)) {
+    if (seq !== qualityProbeSeq) return;
+    if (res.ok && Array.isArray(res.data) && preview.value?.tracks) {
       const qualityLookup = new Map<number, string[]>();
       for (const item of res.data) {
         qualityLookup.set(item.index, item.available_qualities);
@@ -195,7 +215,6 @@ async function handleSourceChange(newSource: any) {
         }
       }
 
-      // 重新对齐单首音质与全局音质选择
       for (const track of preview.value.tracks) {
         const quals = track.available_qualities && track.available_qualities.length > 0
           ? track.available_qualities
@@ -210,15 +229,18 @@ async function handleSourceChange(newSource: any) {
         }
       }
 
-      // 如果全局音质在新音源所有曲目中都不存在，自动对齐到有效音质
       if (!availableGlobalQualities.value.some(q => q.value === globalQuality.value)) {
         globalQuality.value = availableGlobalQualities.value[0]?.value || 'flac';
       }
     }
   } catch (err: any) {
-    showToast(`获取音源支持品质失败: ${err.message}`, 'error');
+    if (seq === qualityProbeSeq) {
+      showToast(`获取音源支持品质失败: ${err.message}`, 'error');
+    }
   } finally {
-    queryingQualities.value = false;
+    if (seq === qualityProbeSeq) {
+      queryingQualities.value = false;
+    }
   }
 }
 
@@ -228,12 +250,16 @@ async function doParse() {
     parseError.value = '缺少歌单解析地址';
     return;
   }
+  qualityProbeSeq++;
+  queryingQualities.value = false;
   parsing.value = true;
   parseError.value = '';
   try {
     const res = await api.parsePlaylist(targetUrl, props.accountId || undefined);
     if (!res.ok || !res.data) throw new Error(res.error || '无法解析这个歌单链接');
     preview.value = res.data;
+    failedPlaylistCover.value = false;
+    failedTrackCovers.value = new Set();
     playlistName.value = res.data.playlist_name || props.initialPlaylistName || '未命名歌单';
     selectedIndexes.value = res.data.tracks.map(track => track.index);
     globalQuality.value = 'flac';
@@ -248,6 +274,10 @@ async function doParse() {
         targetUser.value = res.data.matched_account.owner_user;
         if (!props.defaultTargetType) targetType.value = 'user';
       }
+    }
+    if (!isAdmin.value) {
+      targetType.value = 'user';
+      if (props.currentUser?.username) targetUser.value = props.currentUser.username;
     }
     if (!res.data.tracks.length) {
       showToast('歌单解析成功，但没有可导入的歌曲。', 'warning');
@@ -276,10 +306,13 @@ async function handleSubmit() {
       quality: getTrackQuality(track)
     }));
 
-    const finalUser = targetUser.value || boundUserName.value || (props.userList[0]?.name || 'admin');
+    const effectiveTarget = isAdmin.value ? targetType.value : 'user';
+    const finalUser = !isAdmin.value && props.currentUser?.username
+      ? props.currentUser.username
+      : (targetUser.value || boundUserName.value || (props.userList[0]?.name || 'admin'));
     const res = await api.startTask({
       url: props.url.trim(),
-      target: targetType.value,
+      target: effectiveTarget,
       user: finalUser,
       playlist_name: playlistName.value.trim(),
       quality: globalQuality.value,
@@ -298,6 +331,13 @@ async function handleSubmit() {
   }
 }
 
+watch(isAdmin, (adm) => {
+  if (!adm) {
+    targetType.value = 'user';
+    if (props.currentUser?.username) targetUser.value = props.currentUser.username;
+  }
+});
+
 watch(() => props.defaultTargetUser, (newVal) => {
   if (newVal) {
     targetUser.value = newVal;
@@ -308,7 +348,7 @@ watch(() => props.defaultTargetUser, (newVal) => {
 
 watch(() => props.defaultTargetType, (newVal) => {
   if (newVal) {
-    targetType.value = newVal;
+    targetType.value = isAdmin.value ? newVal : 'user';
   }
 });
 
@@ -328,7 +368,7 @@ watch(() => props.userList, (list) => {
 watch(() => preview.value, (newPreview) => {
   if (newPreview?.matched_account?.owner_user) {
     resolvedAccountUser.value = newPreview.matched_account.owner_user;
-    if (!props.defaultTargetUser) {
+    if (!props.defaultTargetUser && isAdmin.value) {
       targetUser.value = newPreview.matched_account.owner_user;
       if (!props.defaultTargetType) targetType.value = 'user';
     }
@@ -343,11 +383,15 @@ watch(() => props.url, (newUrl) => {
 
 watch(() => props.initialPreview, (val) => {
   if (val) {
+    qualityProbeSeq++;
+    queryingQualities.value = false;
+    failedPlaylistCover.value = false;
+    failedTrackCovers.value = new Set();
     preview.value = val;
     playlistName.value = val.playlist_name || props.initialPlaylistName || '未命名歌单';
     selectedIndexes.value = val.tracks.map(track => track.index);
     selectedSource.value = resolveDefaultSource();
-    if (val.matched_account?.owner_user) {
+    if (val.matched_account?.owner_user && isAdmin.value) {
       resolvedAccountUser.value = val.matched_account.owner_user;
       if (!props.defaultTargetUser) {
         targetUser.value = val.matched_account.owner_user;
@@ -359,6 +403,10 @@ watch(() => props.initialPreview, (val) => {
 
 onMounted(async () => {
   selectedSource.value = resolveDefaultSource();
+  if (!isAdmin.value) {
+    targetType.value = 'user';
+    if (props.currentUser?.username) targetUser.value = props.currentUser.username;
+  }
   if (props.accountId || props.url) {
     try {
       const accRes = await api.getMusicAccounts();
@@ -372,7 +420,7 @@ onMounted(async () => {
           if (urlLower.includes('qq.com')) matched = accRes.data.find(a => a.provider === 'qq' && a.connected);
           else if (urlLower.includes('163.com')) matched = accRes.data.find(a => a.provider === 'netease' && a.connected);
         }
-        if (matched && matched.owner_user) {
+        if (matched && matched.owner_user && isAdmin.value) {
           resolvedAccountUser.value = matched.owner_user;
           if (!targetUser.value || !props.defaultTargetUser) {
             targetUser.value = matched.owner_user;
@@ -430,7 +478,15 @@ onMounted(async () => {
         <!-- 歌单封面与名称输入 -->
         <div class="flex items-center gap-3 rounded-xl border border-border bg-muted/20 p-2.5 sm:p-3">
           <div class="relative h-12 w-12 sm:h-14 sm:w-14 shrink-0 overflow-hidden rounded-lg bg-muted shadow-sm">
-            <img v-if="preview?.cover_url" :src="preview.cover_url" alt="歌单封面" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer" />
+            <img
+              v-if="preview?.cover_url && !failedPlaylistCover"
+              :src="preview.cover_url"
+              alt="歌单封面"
+              class="h-full w-full object-cover"
+              loading="lazy"
+              referrerpolicy="no-referrer"
+              @error="failedPlaylistCover = true"
+            />
             <Music2 v-else class="absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 text-muted-foreground/50" />
           </div>
           <div class="min-w-0 flex-1 space-y-1">
@@ -444,7 +500,7 @@ onMounted(async () => {
 
         <!-- 导入设置网格：可见范围 + 统一品质 + 音源配置 -->
         <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-3">
-          <div class="space-y-1">
+          <div v-if="isAdmin" class="space-y-1">
             <label class="block text-[11px] font-medium text-muted-foreground">可见范围</label>
             <Select v-model="targetType">
               <SelectTrigger class="h-8 sm:h-9 text-xs">
@@ -457,7 +513,7 @@ onMounted(async () => {
             </Select>
           </div>
 
-          <div v-if="targetType === 'user'" class="space-y-1">
+          <div v-if="isAdmin && targetType === 'user'" class="space-y-1">
             <div class="flex items-center justify-between">
               <label class="block text-[11px] font-medium text-muted-foreground">所属成员</label>
               <span v-if="boundUserName && targetUser === boundUserName" class="text-[10px] text-primary font-medium">账号绑定成员</span>
@@ -498,7 +554,7 @@ onMounted(async () => {
             </Select>
           </div>
 
-          <div class="space-y-1" :class="targetType !== 'user' ? 'col-span-2 sm:col-span-1' : 'col-span-2 sm:col-span-1'">
+          <div class="space-y-1" :class="isAdmin ? 'col-span-2 sm:col-span-1' : ''">
             <div class="flex items-center justify-between">
               <label class="block text-[11px] font-medium text-muted-foreground">抓取音源</label>
               <span v-if="queryingQualities" class="text-[10px] text-primary flex items-center gap-1 font-medium animate-pulse">
@@ -506,7 +562,7 @@ onMounted(async () => {
               </span>
               <span v-else-if="selectedSource === 'tx' || selectedSource === 'wy'" class="text-[10px] text-primary font-semibold">平台优先</span>
             </div>
-            <Select :model-value="selectedSource" :disabled="queryingQualities" @update:model-value="handleSourceChange">
+            <Select :model-value="selectedSource" @update:model-value="handleSourceChange">
               <SelectTrigger class="h-8 sm:h-9 text-xs font-semibold">
                 <SelectValue placeholder="选择音源" />
               </SelectTrigger>
@@ -516,6 +572,7 @@ onMounted(async () => {
                 <SelectItem value="kw">酷我音乐 (kw)</SelectItem>
                 <SelectItem value="kg">酷狗音乐 (kg)</SelectItem>
                 <SelectItem value="auto">智能聚合 (auto)</SelectItem>
+                <SelectItem value="custom">自定义音源 (custom)</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -552,7 +609,15 @@ onMounted(async () => {
 
           <!-- 封面缩略图 -->
           <div class="relative h-9 w-9 shrink-0 overflow-hidden rounded-lg bg-muted">
-            <img v-if="track.cover" :src="track.cover" :alt="`${track.title}封面`" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer" />
+            <img
+              v-if="track.cover && !failedTrackCovers.has(track.index)"
+              :src="track.cover"
+              :alt="`${track.title}封面`"
+              class="h-full w-full object-cover"
+              loading="lazy"
+              referrerpolicy="no-referrer"
+              @error="markTrackCoverFailed(track.index)"
+            />
             <Music2 v-else class="absolute left-1/2 top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 text-muted-foreground" />
           </div>
 
@@ -566,12 +631,13 @@ onMounted(async () => {
 
           <!-- 状态或单曲音质选择器 -->
           <div class="shrink-0 flex items-center">
-            <span
+            <Badge
               v-if="track.exists"
-              class="inline-flex items-center gap-1 rounded-md bg-success/15 px-2 py-0.5 text-[10px] font-semibold text-success"
+              variant="success"
+              class="gap-1 px-2 py-0.5 text-[10px] font-semibold"
             >
               <Check class="h-3 w-3" />已收录
-            </span>
+            </Badge>
             <div v-else class="flex items-center gap-1">
               <Select
                 :model-value="getTrackQuality(track)"

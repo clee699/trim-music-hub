@@ -71,6 +71,7 @@ const emit = defineEmits<{
   (e: "task-started"): void;
   (e: "open-accounts"): void;
   (e: "update:initialSubTab", val: SearchSubTab): void;
+  (e: "selection-change", val: boolean): void;
 }>();
 
 const activeSubTab = ref<SearchSubTab>(props.initialSubTab || "parse");
@@ -193,23 +194,56 @@ const currentPage = ref(0);
 const hasMore = ref(false);
 const downloadingMap = ref<Record<string, boolean>>({});
 const selectedQualityMap = ref<Record<string, string>>({});
+const failedSearchCovers = ref<Set<string>>(new Set());
+let onlineSearchSeq = 0;
+
+function markSearchCoverFailed(key: string) {
+  const next = new Set(failedSearchCovers.value);
+  next.add(key);
+  failedSearchCovers.value = next;
+}
 
 const selectedSongKeys = ref<Set<string>>(new Set());
 const selectedCount = computed(() => selectedSongKeys.value.size);
 const isAllSelected = computed(
   () =>
     searchResults.value.length > 0 &&
-    selectedCount.value === searchResults.value.length
+    searchResults.value.every((s, idx) => selectedSongKeys.value.has(songKey(s, idx)))
+);
+
+watch(
+  () => activeSubTab.value === "search" && selectedCount.value > 0,
+  (val) => {
+    emit("selection-change", val);
+  }
 );
 
 const batchModalOpen = ref(false);
-const batchCreatePlaylist = ref(true);
+const batchActionMode = ref<"playlist" | "download">("playlist");
+const batchCreatePlaylist = computed(() => batchActionMode.value === "playlist");
 const batchPlaylistName = ref("");
-const batchTargetType = ref<"public" | "user">("public");
+const batchTargetType = ref<"public" | "user">("user");
 const batchTargetUser = ref("admin");
-const batchQuality = ref<"flac" | "320k" | "128k">("flac");
+const batchQuality = ref<"flac24bit" | "flac" | "320k" | "128k">("flac");
 const batchSource = ref<"kw" | "kg" | "tx" | "wy" | "auto" | "custom">("kw");
 const batchSubmitting = ref(false);
+
+const batchActionTabs: SpringTabItem<"playlist" | "download">[] = [
+  { value: "playlist", label: "创建为新歌单", icon: ListPlus },
+  { value: "download", label: "仅下载歌曲入库", icon: Download },
+];
+
+const batchVisibilityTabs: SpringTabItem<"public" | "user">[] = [
+  { value: "public", label: "公共歌单" },
+  { value: "user", label: "个人歌单" },
+];
+
+const batchQualityTabs: SpringTabItem<"flac24bit" | "flac" | "320k" | "128k">[] = [
+  { value: "flac24bit", label: "Hi-Res" },
+  { value: "flac", label: "FLAC" },
+  { value: "320k", label: "320K" },
+  { value: "128k", label: "128K" },
+];
 
 const selectedSongs = computed(() =>
   searchResults.value.filter((song, idx) =>
@@ -279,10 +313,15 @@ async function handleBatchSubmit() {
         quality: batchQuality.value,
       }));
 
+      const effectiveTarget = props.currentUser?.isAdmin ? batchTargetType.value : "user";
+      const effectiveUser = !props.currentUser?.isAdmin && props.currentUser?.username
+        ? props.currentUser.username
+        : (batchTargetUser.value || "admin");
+
       const res = await api.startTask({
         url: "custom://search-batch",
-        target: batchTargetType.value,
-        user: batchTargetUser.value || "admin",
+        target: effectiveTarget,
+        user: effectiveUser,
         playlist_name: batchPlaylistName.value.trim(),
         quality: batchQuality.value,
         source: batchSource.value,
@@ -312,7 +351,7 @@ async function handleBatchSubmit() {
       let addedCount = 0;
       for (const song of toDownload) {
         try {
-          await api.downloadSingle({
+          const res = await api.downloadSingle({
             artist: song.artist,
             song: song.title,
             album: song.album,
@@ -320,14 +359,20 @@ async function handleBatchSubmit() {
             quality: batchQuality.value,
             source: batchSource.value,
           });
-          song.exists = true;
-          song.local_path = "正在下载入库中...";
-          addedCount++;
+          if (res.ok) {
+            song.exists = true;
+            song.local_path = "正在下载入库中...";
+            addedCount++;
+          }
         } catch {}
       }
-      showToast(`已成功将 ${addedCount} 首歌曲加入下载队列！`, "success");
-      clearSelection();
-      batchModalOpen.value = false;
+      if (addedCount > 0) {
+        showToast(`已成功将 ${addedCount} 首歌曲加入下载队列！`, "success");
+        clearSelection();
+        batchModalOpen.value = false;
+      } else {
+        showToast("未能将歌曲加入下载队列，请稍后重试", "error");
+      }
     }
   } catch (e: any) {
     showToast(`批量操作失败：${e.message}`, "error");
@@ -410,20 +455,22 @@ async function handleSourceChange(newSrc: unknown) {
   if (!newSrc) return;
   const srcStr = String(newSrc) as typeof currentSource.value;
   currentSource.value = srcStr;
+  const srcLabel = availableSources.value.find((s) => s.id === srcStr)?.name || srcStr;
+  if (!props.currentUser?.isAdmin) {
+    showToast(`下载音源已切换为“${srcLabel}”。`, "success");
+    return;
+  }
   try {
     const res = await api.updateSettings(srcStr);
     if (res.ok) {
-      showToast(
-        `下载音源已切换为“${availableSources.value.find((s) => s.id === srcStr)?.name}”。`,
-        "success"
-      );
+      showToast(`下载音源已切换为“${srcLabel}”。`, "success");
     }
   } catch (e: any) {
     showToast(`切换音源失败：${e.message}`, "error");
   }
 }
 
-async function fetchSearchPage(page: number, append = false) {
+async function fetchSearchPage(page: number, append = false, seq = ++onlineSearchSeq) {
   const kw = searchKeyword.value.trim();
   if (!kw) return;
   if (append) isLoadingMore.value = true;
@@ -431,6 +478,7 @@ async function fetchSearchPage(page: number, append = false) {
 
   try {
     const res = await api.searchOnline(kw, page, 20);
+    if (seq !== onlineSearchSeq) return;
     if (!res.ok) {
       showToast("暂时无法搜索歌曲，请稍后重试。", "error");
       return;
@@ -451,10 +499,14 @@ async function fetchSearchPage(page: number, append = false) {
     if (!append && incoming.length === 0)
       showToast("没有找到匹配歌曲，试试其他关键词。", "info");
   } catch (e: any) {
-    showToast(`${append ? "加载更多" : "搜索"}失败：${e.message}`, "error");
+    if (seq === onlineSearchSeq) {
+      showToast(`${append ? "加载更多" : "搜索"}失败：${e.message}`, "error");
+    }
   } finally {
-    if (append) isLoadingMore.value = false;
-    else isSearching.value = false;
+    if (seq === onlineSearchSeq) {
+      if (append) isLoadingMore.value = false;
+      else isSearching.value = false;
+    }
   }
 }
 
@@ -463,12 +515,17 @@ const isPullRefreshing = ref(false);
 async function onPullRefresh() {
   const kw = searchKeyword.value.trim();
   if (!kw) return;
+  const seq = ++onlineSearchSeq;
+  isLoadingMore.value = false;
   isPullRefreshing.value = true;
   try {
     const res = await api.searchOnline(kw, 1, 20);
+    if (seq !== onlineSearchSeq) return;
     if (res.ok) {
       const incoming = res.data || [];
       searchResults.value = incoming;
+      selectedSongKeys.value = new Set();
+      failedSearchCovers.value = new Set();
       incoming.forEach((song, index) => initializeQuality(song, index));
       currentPage.value = res.page || 1;
       hasMore.value = Boolean(res.has_more);
@@ -476,9 +533,13 @@ async function onPullRefresh() {
       showToast("暂时无法刷新搜索结果，请稍后重试。", "error");
     }
   } catch (e: any) {
-    showToast(`刷新失败：${e.message}`, "error");
+    if (seq === onlineSearchSeq) {
+      showToast(`刷新失败：${e.message}`, "error");
+    }
   } finally {
-    isPullRefreshing.value = false;
+    if (seq === onlineSearchSeq) {
+      isPullRefreshing.value = false;
+    }
   }
 }
 
@@ -488,11 +549,15 @@ async function handleSearch() {
     showToast("先输入歌名、歌手或专辑。", "warning");
     return;
   }
-  if (isSearching.value || isLoadingMore.value) return;
+  if (isSearching.value) return;
+  const seq = ++onlineSearchSeq;
+  isLoadingMore.value = false;
+  selectedSongKeys.value = new Set();
+  failedSearchCovers.value = new Set();
   searchResults.value = [];
   currentPage.value = 0;
   hasMore.value = false;
-  await fetchSearchPage(1);
+  await fetchSearchPage(1, false, seq);
 }
 
 async function loadMore() {
@@ -503,7 +568,7 @@ async function loadMore() {
     currentPage.value < 1
   )
     return;
-  await fetchSearchPage(currentPage.value + 1, true);
+  await fetchSearchPage(currentPage.value + 1, true, onlineSearchSeq);
 }
 
 async function triggerDownload(song: SearchSong, idx: number) {
@@ -516,7 +581,7 @@ async function triggerDownload(song: SearchSong, idx: number) {
 
   downloadingMap.value[key] = true;
   showToast(
-    `正在下载“${song.artist} - ${song.title}”（${quality.toUpperCase()}）。`,
+    `正在下载“${song.artist} - ${song.title}”（${getQualityShortCode(quality)}）。`,
     "info"
   );
   try {
@@ -623,14 +688,16 @@ onMounted(() => {
             <span class="inline-block h-1.5 w-1.5 rounded-full bg-primary/70"></span>
             支持歌单链接智能解析，自选导入曲目与无损音质，曲库已有曲目自动关联
           </p>
-          <button
+          <Button
             v-if="parsedPreview"
             type="button"
-            class="shrink-0 inline-flex items-center gap-1 text-[11px] text-primary hover:underline font-medium"
+            variant="ghost"
+            size="sm"
+            class="h-6 px-2 shrink-0 text-[11px] text-primary hover:text-primary hover:bg-primary/10 gap-1"
             @click="resetParsePreview"
           >
             <RotateCcw class="h-3 w-3" />重置解析
-          </button>
+          </Button>
         </div>
       </form>
 
@@ -649,7 +716,7 @@ onMounted(() => {
           <Button
             type="submit"
             size="lg"
-            :disabled="isSearching || isLoadingMore"
+            :disabled="isSearching"
             class="h-10 sm:h-11 shrink-0 px-4 sm:px-6 font-semibold gap-1.5 active:scale-95 transition-transform"
           >
             <Loader2 v-if="isSearching" class="h-4 w-4 animate-spin" />
@@ -686,6 +753,7 @@ onMounted(() => {
           :user-list="userList"
           :initial-preview="parsedPreview"
           :show-back-button="true"
+          :current-user="currentUser"
           @back="resetParsePreview"
           @cancel="resetParsePreview"
           @started="handleImportStarted"
@@ -708,7 +776,7 @@ onMounted(() => {
         <Card class="p-4 sm:p-6 bg-card/75 border-border/80">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-border/60">
             <div class="flex items-start gap-3">
-              <div class="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-primary/12 text-primary border border-primary/20">
+              <div class="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-primary/15 text-primary border border-primary/20">
                 <ListMusic class="h-5 w-5" />
               </div>
               <div>
@@ -747,7 +815,7 @@ onMounted(() => {
                 <span>2. 双轨查重与音质自选</span>
               </div>
               <p class="text-[11px] text-muted-foreground leading-relaxed">
-                自动标记本地曲库已有歌曲并直接关联复用，未收录歌曲可自由指定 FLAC 无损或 320K 音质。
+                自动标记本地曲库已有歌曲并直接关联复用，未收录歌曲可自由指定 Hi-Res、FLAC 无损或 320K 音质。
               </p>
             </div>
 
@@ -757,7 +825,7 @@ onMounted(() => {
                 <span>3. 自动生成飞牛歌单</span>
               </div>
               <p class="text-[11px] text-muted-foreground leading-relaxed">
-                下载完成后自动注入高清歌单封面、内嵌歌词标签，并同步至公共或个人专属飞牛曲库。
+                下载完成后自动注入高清歌单封面、内嵌歌词标签，并同步至飞牛曲库。
               </p>
             </div>
           </div>
@@ -818,18 +886,27 @@ onMounted(() => {
               :class="selectedSongKeys.has(songKey(song, idx)) ? 'media-list-row--selected' : ''"
             >
               <!-- 多选框 -->
-              <button
-                type="button"
-                class="flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                :class="selectedSongKeys.has(songKey(song, idx)) ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/80 bg-background/60 hover:border-primary/50'"
+              <Checkbox
+                :checked="selectedSongKeys.has(songKey(song, idx))"
                 :aria-label="selectedSongKeys.has(songKey(song, idx)) ? '取消勾选' : '勾选此歌曲'"
-                @click.stop="toggleSelectSong(song, idx)"
-              >
-                <Check v-if="selectedSongKeys.has(songKey(song, idx))" class="h-3.5 w-3.5 stroke-[3]" />
-              </button>
+                class="shrink-0"
+                @update:checked="() => toggleSelectSong(song, idx)"
+                @click.stop
+              />
 
               <div class="search-result-row__art" @click="toggleSelectSong(song, idx)">
-                <img :src="song.cover || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80'" :alt="`${song.title} 封面`" loading="lazy" decoding="async" referrerpolicy="no-referrer" />
+                <img
+                  v-if="song.cover && !failedSearchCovers.has(songKey(song, idx))"
+                  :src="song.cover"
+                  :alt="`${song.title} 封面`"
+                  loading="lazy"
+                  decoding="async"
+                  referrerpolicy="no-referrer"
+                  @error="markSearchCoverFailed(songKey(song, idx))"
+                />
+                <div v-else class="media-list-row__art-fallback">
+                  <Disc3 class="h-6 w-6 text-primary/35" />
+                </div>
               </div>
               <div class="search-result-row__content" @click="toggleSelectSong(song, idx)">
                 <div class="flex min-w-0 items-center gap-2">
@@ -841,17 +918,19 @@ onMounted(() => {
               </div>
 
               <div v-if="!song.exists" class="search-result-row__action shrink-0">
-                <div class="inline-flex items-center h-8 rounded-full border border-primary/35 bg-primary/10 backdrop-blur-sm overflow-hidden shadow-2xs transition-all hover:border-primary/55 hover:bg-primary/15">
-                  <button
+                <div class="inline-flex items-center h-8 rounded-full border border-primary/35 bg-primary/10 backdrop-blur-sm overflow-hidden shadow-sm transition-all hover:border-primary/55 hover:bg-primary/15">
+                  <Button
                     type="button"
-                    class="group/dl flex items-center gap-1 h-full pl-3 pr-2 text-xs font-semibold text-primary hover:bg-primary hover:text-primary-foreground active:scale-95 transition-all whitespace-nowrap shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                    variant="ghost"
+                    size="sm"
+                    class="group/dl h-full rounded-none pl-3 pr-2 text-xs font-semibold text-primary hover:bg-primary hover:text-primary-foreground active:scale-95 transition-all whitespace-nowrap shrink-0 gap-1"
                     :disabled="downloadingMap[songKey(song, idx)]"
                     @click.stop="triggerDownload(song, idx)"
                   >
                     <Loader2 v-if="downloadingMap[songKey(song, idx)]" class="h-3.5 w-3.5 animate-spin shrink-0" />
                     <ArrowDownToLine v-else class="h-3.5 w-3.5 shrink-0 transition-transform group-hover/dl:translate-y-0.5" />
                     <span>{{ downloadingMap[songKey(song, idx)] ? "下载中" : "下载" }}</span>
-                  </button>
+                  </Button>
                   <div class="h-3.5 w-px bg-primary/25 shrink-0"></div>
                   <Select v-model="selectedQualityMap[songKey(song, idx)]" :disabled="downloadingMap[songKey(song, idx)]">
                     <SelectTrigger class="h-full min-w-[52px] gap-0.5 rounded-none border-0 bg-transparent hover:bg-primary/15 pl-1.5 pr-2.5 text-[11px] font-bold font-mono text-primary shadow-none focus:ring-0 transition-colors whitespace-nowrap shrink-0 [&>svg]:h-3 [&>svg]:w-3 [&>svg]:text-primary/75">
@@ -870,10 +949,10 @@ onMounted(() => {
                 </div>
               </div>
               <div v-else class="search-result-row__action shrink-0">
-                <div class="inline-flex items-center gap-1.5 h-8 px-3 rounded-full border border-success/30 bg-success/10 text-success text-xs font-medium whitespace-nowrap shrink-0">
+                <Badge variant="success" class="h-8 px-3 rounded-full text-xs font-medium gap-1.5 whitespace-nowrap shrink-0">
                   <CheckCircle class="h-3.5 w-3.5 shrink-0" />
                   <span>已在曲库</span>
-                </div>
+                </Badge>
               </div>
             </article>
 
@@ -932,36 +1011,14 @@ onMounted(() => {
         </DialogHeader>
 
         <div class="space-y-4 py-2">
-          <!-- 导入方式选择 -->
+          <!-- 导入方式选择 (物理惯性弹簧切换器) -->
           <div class="space-y-1.5">
             <label class="text-xs font-semibold text-foreground">处理方式</label>
-            <div class="grid grid-cols-2 gap-2.5">
-              <button
-                type="button"
-                class="flex flex-col items-start gap-1 rounded-xl border p-3 text-left transition-all"
-                :class="batchCreatePlaylist ? 'border-primary bg-primary/10 ring-1 ring-primary/30' : 'border-border bg-card hover:bg-muted/40'"
-                @click="batchCreatePlaylist = true"
-              >
-                <div class="flex items-center gap-1.5 font-semibold text-xs text-foreground">
-                  <ListPlus class="h-3.5 w-3.5 text-primary" />
-                  <span>创建为新歌单</span>
-                </div>
-                <span class="text-[10px] text-muted-foreground leading-4">生成独立歌单并同步至飞牛</span>
-              </button>
-
-              <button
-                type="button"
-                class="flex flex-col items-start gap-1 rounded-xl border p-3 text-left transition-all"
-                :class="!batchCreatePlaylist ? 'border-primary bg-primary/10 ring-1 ring-primary/30' : 'border-border bg-card hover:bg-muted/40'"
-                @click="batchCreatePlaylist = false"
-              >
-                <div class="flex items-center gap-1.5 font-semibold text-xs text-foreground">
-                  <Download class="h-3.5 w-3.5 text-primary" />
-                  <span>仅下载歌曲入库</span>
-                </div>
-                <span class="text-[10px] text-muted-foreground leading-4">自动跳过已存在的曲目</span>
-              </button>
-            </div>
+            <SpringTabs
+              v-model="batchActionMode"
+              :items="batchActionTabs"
+              full-width
+            />
           </div>
 
           <!-- 歌单信息 (当创建歌单时展示) -->
@@ -975,29 +1032,17 @@ onMounted(() => {
               />
             </div>
 
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">可见范围与归属</label>
-              <div class="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  class="flex items-center justify-center gap-1.5 h-8 rounded-lg border text-xs font-medium transition-all"
-                  :class="batchTargetType === 'public' ? 'border-primary bg-primary/10 text-primary font-semibold' : 'border-border bg-card text-muted-foreground'"
-                  @click="batchTargetType = 'public'"
-                >
-                  公共歌单
-                </button>
-                <button
-                  type="button"
-                  class="flex items-center justify-center gap-1.5 h-8 rounded-lg border text-xs font-medium transition-all"
-                  :class="batchTargetType === 'user' ? 'border-primary bg-primary/10 text-primary font-semibold' : 'border-border bg-card text-muted-foreground'"
-                  @click="batchTargetType = 'user'"
-                >
-                  专属个人歌单
-                </button>
-              </div>
+            <div v-if="currentUser?.isAdmin" class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">可见范围</label>
+              <SpringTabs
+                v-model="batchTargetType"
+                :items="batchVisibilityTabs"
+                size="sm"
+                full-width
+              />
             </div>
 
-            <div v-if="batchTargetType === 'user'" class="space-y-1.5">
+            <div v-if="currentUser?.isAdmin && batchTargetType === 'user'" class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">所属飞牛用户</label>
               <Select v-model="batchTargetUser">
                 <SelectTrigger class="h-9 text-xs bg-card">
@@ -1012,25 +1057,15 @@ onMounted(() => {
             </div>
           </div>
 
-          <!-- 音质选择 -->
+          <!-- 音质选择 (物理惯性弹簧切换器) -->
           <div class="space-y-1.5">
             <label class="text-xs font-semibold text-foreground">下载音质</label>
-            <div class="grid grid-cols-3 gap-2">
-              <button
-                v-for="q in [
-                  { id: 'flac', label: 'FLAC 无损' },
-                  { id: '320k', label: '320K 高品' },
-                  { id: '128k', label: '128K 标准' },
-                ]"
-                :key="q.id"
-                type="button"
-                class="flex items-center justify-center h-8 rounded-lg border text-xs font-medium transition-all"
-                :class="batchQuality === q.id ? 'border-primary bg-primary/10 text-primary font-semibold' : 'border-border bg-card text-muted-foreground'"
-                @click="batchQuality = q.id as any"
-              >
-                {{ q.label }}
-              </button>
-            </div>
+            <SpringTabs
+              v-model="batchQuality"
+              :items="batchQualityTabs"
+              size="sm"
+              full-width
+            />
           </div>
 
           <!-- 提示说明 -->

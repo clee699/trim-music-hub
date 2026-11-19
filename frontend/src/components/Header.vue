@@ -1,15 +1,17 @@
 <script setup lang="ts">
+import { ref, watch } from 'vue';
 import { Activity, Search, ListMusic, Database, History, Radio, Plus, Wifi, WifiOff, Settings, Sun, Moon, UserRound, LogOut, UserCheck } from 'lucide-vue-next';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Popconfirm } from '@/components/ui/popconfirm';
 import { useTheme } from '@/composables/useTheme';
+import { useSpringInertia } from '@/composables/useSpringInertia';
 import MobileTabBar from '@/components/mobile/MobileTabBar.vue';
 import type { CurrentUser } from '@/types';
 
 type TabKey = 'monitor' | 'search' | 'playlists' | 'library' | 'history';
 
-defineProps<{ activeTab: TabKey; connected: boolean; currentUser?: CurrentUser | null }>();
+const props = defineProps<{ activeTab: TabKey; connected: boolean; currentUser?: CurrentUser | null }>();
 const emit = defineEmits<{
   (e: 'update:activeTab', val: TabKey): void;
   (e: 'new-task'): void;
@@ -30,6 +32,53 @@ const navigation = [
   { value: 'library' as const, label: '曲库', fullLabel: '本地曲库', hint: '检索与清理', icon: Database },
   { value: 'history' as const, label: '记录', fullLabel: '操作记录', hint: '查看历史', icon: History },
 ];
+
+const desktopNavRef = ref<HTMLElement | null>(null);
+const desktopSliderRef = ref<HTMLElement | null>(null);
+const desktopItemRefs = ref<HTMLElement[]>([]);
+
+function setDesktopItemRef(el: any, idx: number) {
+  const domEl = el?.$el ?? el;
+  if (domEl) desktopItemRefs.value[idx] = domEl as HTMLElement;
+}
+
+const localTab = ref<TabKey>(props.activeTab);
+let internalDesktopTarget: TabKey | null = null;
+
+const { isReady: desktopReady, updateIndicator: updateDesktopIndicator } = useSpringInertia(
+  desktopNavRef,
+  desktopSliderRef,
+  desktopItemRefs,
+  {
+    orientation: 'vertical',
+    getActiveIndex: () => navigation.findIndex(item => item.value === localTab.value),
+  }
+);
+
+function selectDesktopTab(val: TabKey, newIdx: number) {
+  if (val === localTab.value) return;
+  const oldIdx = navigation.findIndex(item => item.value === localTab.value);
+  const steps = Math.abs(newIdx - (oldIdx !== -1 ? oldIdx : newIdx)) || 1;
+  internalDesktopTarget = val;
+  localTab.value = val;
+  updateDesktopIndicator(false, steps, newIdx);
+  emit('update:activeTab', val);
+}
+
+watch(() => props.activeTab, (newVal, oldVal) => {
+  localTab.value = newVal;
+  if (internalDesktopTarget === newVal) {
+    internalDesktopTarget = null;
+    return;
+  }
+  internalDesktopTarget = null;
+  const oldIdx = oldVal ? navigation.findIndex(item => item.value === oldVal) : -1;
+  const newIdx = navigation.findIndex(item => item.value === newVal);
+  if (newIdx !== -1) {
+    const steps = Math.abs(newIdx - (oldIdx !== -1 ? oldIdx : newIdx)) || 1;
+    updateDesktopIndicator(false, steps, newIdx);
+  }
+});
 </script>
 
 <template>
@@ -69,13 +118,27 @@ const navigation = [
       </Popconfirm>
     </div>
 
-    <nav class="mt-8 space-y-1" aria-label="主要导航">
-      <Button variant="ghost" v-for="item in navigation" :key="item.value" type="button"
-        class="group flex h-auto w-full items-center justify-start gap-3 whitespace-normal rounded-xl px-3 py-2.5 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring/60"
-        :class="activeTab === item.value ? 'bg-card text-foreground shadow-sm ring-1 ring-border/80' : 'text-muted-foreground hover:bg-card/60 hover:text-foreground'"
-        @click="emit('update:activeTab', item.value)">
+    <nav ref="desktopNavRef" class="relative mt-8 space-y-1 isolate" aria-label="主要导航">
+      <div
+        ref="desktopSliderRef"
+        class="pointer-events-none absolute inset-x-0 top-0 z-0 will-change-transform origin-center transition-opacity duration-150"
+        :class="desktopReady ? 'opacity-100' : 'opacity-0'"
+        aria-hidden="true"
+      >
+        <div class="h-full w-full rounded-xl bg-card shadow-sm ring-1 ring-border/80" />
+      </div>
+      <Button
+        variant="ghost"
+        v-for="(item, idx) in navigation"
+        :key="item.value"
+        :ref="(el) => setDesktopItemRef(el, idx)"
+        type="button"
+        class="relative z-10 group flex h-auto w-full items-center justify-start gap-3 whitespace-normal rounded-xl px-3 py-2.5 text-left transition-colors hover:bg-transparent focus-visible:ring-2 focus-visible:ring-ring/60"
+        :class="localTab === item.value ? 'text-foreground' : 'text-muted-foreground hover:bg-card/45 hover:text-foreground'"
+        @click="selectDesktopTab(item.value, idx)"
+      >
         <span class="grid h-9 w-9 shrink-0 place-items-center rounded-[11px] transition-colors"
-          :class="activeTab === item.value ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground group-hover:text-foreground'">
+          :class="localTab === item.value ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground group-hover:text-foreground'">
           <component :is="item.icon" class="h-4 w-4" />
         </span>
         <span class="min-w-0 flex-1">

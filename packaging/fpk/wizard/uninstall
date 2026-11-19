@@ -1,0 +1,23 @@
+[
+  {
+    "stepTitle": "卸载选项",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_uninstall_data",
+        "label": "应用配置与历史记录处理方式",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留应用配置、导入历史与已绑定音乐账号（便于日后升级或重装）",
+            "value": "keep"
+          },
+          {
+            "label": "彻底清理应用配置与缓存（绝不删除本地音乐文件与飞牛歌单）",
+            "value": "purge"
+          }
+        ]
+      }
+    ]
+  }
+]

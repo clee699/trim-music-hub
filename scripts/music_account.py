@@ -15,10 +15,23 @@ import urllib.request
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 
 
+def sanitize_cookie(raw: str) -> str:
+    if not raw:
+        return ""
+    parts = []
+    for line in str(raw).replace("\r", "\n").split("\n"):
+        s = line.strip().strip(";")
+        if s:
+            parts.append(s)
+    joined = "; ".join(parts)
+    return re.sub(r"[\x00-\x1f\x7f]", "", joined).strip()
+
+
 def request_json(url, cookie="", referer=""):
     headers = {"User-Agent": USER_AGENT}
-    if cookie:
-        headers["Cookie"] = cookie
+    clean_cookie = sanitize_cookie(cookie)
+    if clean_cookie:
+        headers["Cookie"] = clean_cookie
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
@@ -40,7 +53,7 @@ def media_url(raw):
 
 def cookie_map(raw):
     result = {}
-    for part in re.split(r"[;\n]+", raw or ""):
+    for part in re.split(r"[;\r\n]+", raw or ""):
         if "=" not in part:
             continue
         key, value = part.split("=", 1)
@@ -64,37 +77,44 @@ def qq_music_key(cookies):
     return ""
 
 
+def qq_gtk(cookies):
+    skey = (
+        cookies.get("p_skey")
+        or cookies.get("qqmusic_key")
+        or cookies.get("qm_keyst")
+        or cookies.get("skey")
+        or cookies.get("wxskey")
+        or ""
+    )
+    h = 5381
+    for ch in skey:
+        h += (h << 5) + ord(ch)
+    return h & 0x7FFFFFFF
+
+
 def netease_status(cookie):
     cmap = cookie_map(cookie)
     if not cmap.get("MUSIC_U"):
         return {"connected": False, "error": "网易云 Cookie 缺少 MUSIC_U"}
     try:
         data = request_json("https://music.163.com/api/nuser/account/get", cookie, "https://music.163.com/")
-        profile = data.get("profile") or {}
-        account = data.get("account") or {}
-        user_id = profile.get("userId") or account.get("id")
-        if user_id:
+        profile = data.get("profile") if isinstance(data, dict) else None
+        if isinstance(profile, dict) and profile.get("userId"):
+            user_id = str(profile.get("userId"))
             return {
                 "connected": True,
-                "user_id": str(user_id),
+                "user_id": user_id,
                 "nickname": profile.get("nickname") or "网易云用户",
                 "avatar": media_url(profile.get("avatarUrl")),
             }
-    except Exception:
-        pass
-
-    # 兜底：若已获取到 MUSIC_U 凭据但获取详情接口波动，仍允许作为已连接
-    return {
-        "connected": True,
-        "user_id": "",
-        "nickname": "网易云用户",
-        "avatar": "",
-    }
+        return {"connected": False, "error": "网易云登录态已失效，请重新扫码或更新 Cookie"}
+    except Exception as exc:
+        return {"connected": False, "error": f"校验网易云账号失败: {exc}"}
 
 
 def netease_playlists(cookie):
     status = netease_status(cookie)
-    if not status.get("connected"):
+    if not status.get("connected") or not status.get("user_id"):
         return {**status, "playlists": []}
     items = []
     offset = 0
@@ -132,7 +152,7 @@ def netease_daily_recommend(cookie):
         headers = {
             "User-Agent": USER_AGENT,
             "Referer": "https://music.163.com/",
-            "Cookie": cookie
+            "Cookie": sanitize_cookie(cookie)
         }
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -247,16 +267,26 @@ def qq_playlists(cookie):
     if not status.get("connected"):
         return {**status, "playlists": []}
     uin = status["user_id"]
-    created = qq_get("https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss", cookie, {
-        "hostUin": 0, "hostuin": uin, "sin": 0, "size": 200, "g_tk": 5381,
-        "loginUin": uin, "format": "json", "inCharset": "utf8", "outCharset": "utf-8",
-        "notice": 0, "platform": "yqq.json", "needNewCode": 0,
-    })
-    collected = qq_get("https://c.y.qq.com/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", cookie, {
-        "ct": 20, "cid": 205360956, "userid": uin, "reqtype": 3, "sin": 0, "ein": 200,
-    })
-    raw_created = ((created.get("data") or {}).get("disslist") or [])
-    raw_collected = ((collected.get("data") or {}).get("cdlist") or [])
+    g_tk = qq_gtk(cookie_map(cookie))
+    created = {}
+    collected = {}
+    try:
+        created = qq_get("https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss", cookie, {
+            "hostUin": 0, "hostuin": uin, "sin": 0, "size": 200, "g_tk": g_tk,
+            "loginUin": uin, "format": "json", "inCharset": "utf8", "outCharset": "utf-8",
+            "notice": 0, "platform": "yqq.json", "needNewCode": 0,
+        })
+    except Exception:
+        created = {}
+    try:
+        collected = qq_get("https://c.y.qq.com/fav/fcgi-bin/fcg_get_profile_order_asset.fcg", cookie, {
+            "ct": 20, "cid": 205360956, "userid": uin, "reqtype": 3, "sin": 0, "ein": 200,
+            "g_tk": g_tk, "format": "json",
+        })
+    except Exception:
+        collected = {}
+    raw_created = ((created.get("data") or {}).get("disslist") or []) if isinstance(created, dict) else []
+    raw_collected = ((collected.get("data") or {}).get("cdlist") or []) if isinstance(collected, dict) else []
     seen = set()
     items = []
     for raw, subscribed in [(pl, False) for pl in raw_created] + [(pl, True) for pl in raw_collected]:
@@ -289,8 +319,9 @@ def fetch_qq_diss_tracks(dissid, cookie=""):
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48",
         "Referer": "https://i2.y.qq.com/n3/other/pages/details/playlist.html",
     }
-    if cookie:
-        headers["Cookie"] = cookie
+    clean_cookie = sanitize_cookie(cookie)
+    if clean_cookie:
+        headers["Cookie"] = clean_cookie
     try:
         req = urllib.request.Request(u_api, data=json.dumps(payload).encode("utf-8"), headers=headers)
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -313,7 +344,9 @@ def fetch_qq_diss_tracks(dissid, cookie=""):
             cover = f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{alb_mid}.jpg" if alb_mid else (dirinfo.get("picurl") or "")
             finfo = s.get("file") or {}
             qualities = []
-            if finfo.get("size_hires") or finfo.get("size_flac"):
+            if finfo.get("size_hires"):
+                qualities.append("flac24bit")
+            if finfo.get("size_flac"):
                 qualities.append("flac")
             if finfo.get("size_320mp3"):
                 qualities.append("320k")
@@ -340,7 +373,7 @@ def fetch_qq_diss_tracks(dissid, cookie=""):
             "track_count": len(tracks),
             "tracks": tracks
         }
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -348,6 +381,7 @@ def fetch_qq_radar_songs(cookie=""):
     u_api = "https://u.y.qq.com/cgi-bin/musicu.fcg"
     tracks = []
     seen_ids = set()
+    clean_cookie = sanitize_cookie(cookie)
 
     def fetch_page(page):
         payload = {
@@ -362,8 +396,8 @@ def fetch_qq_radar_songs(cookie=""):
             "User-Agent": USER_AGENT,
             "Referer": "https://y.qq.com/"
         }
-        if cookie:
-            headers["Cookie"] = cookie
+        if clean_cookie:
+            headers["Cookie"] = clean_cookie
         try:
             req = urllib.request.Request(u_api, data=json.dumps(payload).encode("utf-8"), headers=headers)
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -395,7 +429,9 @@ def fetch_qq_radar_songs(cookie=""):
             cover = f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{alb_mid}.jpg" if alb_mid else ""
             finfo = t.get("file") or {}
             qualities = []
-            if finfo.get("size_hires") or finfo.get("size_flac"):
+            if finfo.get("size_hires"):
+                qualities.append("flac24bit")
+            if finfo.get("size_flac"):
                 qualities.append("flac")
             if finfo.get("size_320mp3"):
                 qualities.append("320k")
@@ -427,6 +463,7 @@ def qq_daily_recommend(cookie):
 
     found_dissid = None
     playlist_title = "今日私享"
+    clean_cookie = sanitize_cookie(cookie)
 
     # 1. 优先尝试从 musicmac/v6/index.html 查找明确带有日推关键词的专属歌单
     try:
@@ -434,7 +471,7 @@ def qq_daily_recommend(cookie):
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) QQMusic/8.5.0",
             "Referer": "https://y.qq.com/",
-            "Cookie": cookie,
+            "Cookie": clean_cookie,
             "Accept-Encoding": "gzip, deflate"
         }
         req = urllib.request.Request(url, headers=headers)

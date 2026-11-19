@@ -1,0 +1,21 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common"
+
+log_info "Running install_callback..."
+check_docker_ready
+load_saved_config
+check_port_conflict "${CFG_PORT}"
+
+ensure_runtime_image 1
+save_config_file
+prepare_and_render_compose "install"
+
+if ! run_compose up -d >> "${LOG_FILE}" 2>&1; then
+  fail_with_msg "启动 TRIM Music Hub 容器失败，请检查端口占用或查看日志 ${LOG_FILE}。"
+fi
+
+wait_for_service_ready || true
+log_info "install_callback completed successfully."
+exit 0

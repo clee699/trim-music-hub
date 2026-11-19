@@ -6,6 +6,7 @@ import { Disc3, ChevronRight } from 'lucide-vue-next';
 const props = defineProps<{
   task: TaskState;
   visible: boolean;
+  offsetBottom?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -46,11 +47,14 @@ const currentCover = computed(() => {
   <Transition name="task-pill-slide">
     <aside
       v-if="visible && isRunning"
-      class="fixed left-1/2 z-40 flex w-[calc(100%-1.25rem)] max-w-lg -translate-x-1/2 cursor-pointer items-center justify-between gap-3 rounded-2xl border border-primary/30 bg-card/90 px-3 py-2 shadow-2xl backdrop-blur-2xl transition-all active:scale-[0.98] lg:hidden"
-      :style="{ bottom: 'calc(4.25rem + env(safe-area-inset-bottom, 0px))' }"
+      class="fixed left-1/2 z-40 flex w-[calc(100%-1.25rem)] max-w-lg -translate-x-1/2 cursor-pointer items-center justify-between gap-3 rounded-2xl border border-primary/30 bg-card/90 px-3 py-2 shadow-2xl backdrop-blur-2xl transition-all active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 lg:hidden"
+      :style="{ bottom: offsetBottom ? 'calc(9.25rem + env(safe-area-inset-bottom, 0px))' : 'calc(4.25rem + env(safe-area-inset-bottom, 0px))' }"
       role="button"
+      tabindex="0"
       aria-label="查看正在进行的同步任务"
       @click="emit('click')"
+      @keydown.enter.prevent="emit('click')"
+      @keydown.space.prevent="emit('click')"
     >
       <div class="flex min-w-0 flex-1 items-center gap-2.5">
         <!-- 唱片封面 -->

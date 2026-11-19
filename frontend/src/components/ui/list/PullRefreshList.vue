@@ -18,6 +18,7 @@ const props = withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<{
   (e: 'refresh'): void;
+  (e: 'scroll', scrollTop: number): void;
 }>();
 
 const containerRef = ref<HTMLElement | null>(null);
@@ -128,6 +129,7 @@ defineExpose({
   <div
     ref="containerRef"
     class="pull-refresh-container relative flex-1 min-h-0 w-full overflow-y-auto overflow-x-hidden select-text overscroll-contain"
+    @scroll="emit('scroll', containerRef?.scrollTop || 0)"
     @touchstart="onTouchStart"
     @touchmove="onTouchMove"
     @touchend="onTouchEnd"

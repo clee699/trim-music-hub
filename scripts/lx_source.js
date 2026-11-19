@@ -733,14 +733,18 @@ const SOURCE_HANDLERS = {
 // --- 构建音源链（按平台和是否高品质排序）---
 function buildSourceChain(platform, isHires, quality) {
   const chain = [];
-  // 基础链：星海主、Huibq、溯音各平台、聆川、长青、念心
   if (SOURCE_HANDLERS.xinghai) chain.push(SOURCE_HANDLERS.xinghai);
-  if (SOURCE_HANDLERS.huibq) chain.push(SOURCE_HANDLERS.huibq);
+  if (SOURCE_HANDLERS.xinghaiBackup) chain.push(SOURCE_HANDLERS.xinghaiBackup);
+  if (SOURCE_HANDLERS.huibq && HUIBQ_REQUEST_KEY && HUIBQ_REQUEST_KEY !== "your_key_here") {
+    chain.push(SOURCE_HANDLERS.huibq);
+  }
   if (platform === "wy" && SOURCE_HANDLERS.suyin163) chain.push(SOURCE_HANDLERS.suyin163);
   if (platform === "tx" && SOURCE_HANDLERS.suyinQQ) chain.push(SOURCE_HANDLERS.suyinQQ);
   if (platform === "kw" && SOURCE_HANDLERS.suyinSearch) chain.push(SOURCE_HANDLERS.suyinSearch);
   if (platform === "mg" && SOURCE_HANDLERS.suyinMigu) chain.push(SOURCE_HANDLERS.suyinMigu);
-  if (SOURCE_HANDLERS.lingchuan) chain.push(SOURCE_HANDLERS.lingchuan);
+  if (SOURCE_HANDLERS.lingchuan && LINGCHUAN_API && !LINGCHUAN_API.includes("api.lingchuan.com")) {
+    chain.push(SOURCE_HANDLERS.lingchuan);
+  }
   if (SOURCE_HANDLERS.changqingVip) chain.push(SOURCE_HANDLERS.changqingVip);
   if (SOURCE_HANDLERS.nianxinVip) chain.push(SOURCE_HANDLERS.nianxinVip);
   return chain;

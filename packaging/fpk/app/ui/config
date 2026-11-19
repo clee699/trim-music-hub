@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "trim-music-hub.main": {
+      "title": "TRIM Music Hub",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/trim-music-hub",
+      "gatewaySocket": "trim-music-hub.sock",
+      "url": "/app/trim-music-hub/",
+      "allUsers": true
+    }
+  }
+}

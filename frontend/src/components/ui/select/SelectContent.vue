@@ -40,7 +40,7 @@ const forwarded = useForwardPropsEmits(delegatedProps, emits)
       )"
     >
       <SelectScrollUpButton />
-      <SelectViewport :class="cn('p-1.5 space-y-0.5', position === 'popper' && 'h-(--reka-select-trigger-height) w-full min-w-(--reka-select-trigger-width)')">
+      <SelectViewport :class="cn('p-1.5 space-y-0.5 custom-scrollbar', position === 'popper' && 'h-[var(--reka-select-trigger-height)] w-full min-w-[var(--reka-select-trigger-width)]')">
         <slot />
       </SelectViewport>
       <SelectScrollDownButton />

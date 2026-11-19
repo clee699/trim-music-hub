@@ -25,9 +25,11 @@ from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-DEFAULT_DB_OPS = "/app/db_ops.py" if os.path.exists("/app/db_ops.py") else "/vol1/1000/Project/trim-music-hub/db_ops.py"
+DATA_DIR = os.path.abspath(os.environ.get("DATA_DIR") or os.path.join(PROJECT_DIR, "data"))
+DEFAULT_DB_OPS = "/app/db_ops.py" if os.path.exists("/app/db_ops.py") else os.path.join(PROJECT_DIR, "db_ops.py")
 DB_OPS_SCRIPT = os.path.join(PROJECT_DIR, "db_ops.py") if os.path.exists(os.path.join(PROJECT_DIR, "db_ops.py")) else DEFAULT_DB_OPS
-SETTINGS_FILE = os.path.join(PROJECT_DIR, "data", "settings.json")
+LX_RUNNER_SCRIPT = os.path.join(SCRIPT_DIR, "lx_runner.cjs")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 QUALITY_RANKS = {
     "128k": 10,
@@ -155,6 +157,36 @@ def sanitize_text(text: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s if s else text.strip()
 
+
+def sanitize_filename_part(text: str, fallback: str = "Unknown") -> str:
+    """Sanitize artist/title for safe filesystem directory & filename creation (handling collaborations like A/B)."""
+    if not text:
+        return fallback
+    s = str(text).replace("/", "、").replace("\\", "、")
+    s = re.sub(r'[<>:"|?*\x00-\x1f]', "_", s)
+    s = s.replace("..", "_").strip(". ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120] if s else fallback
+
+
+def has_unwanted_keyword(candidate_name: str, requested_title: str = "") -> bool:
+    cand_low = (candidate_name or "").lower()
+    req_low = (requested_title or "").lower()
+    for bw in BANNED_KEYWORDS:
+        if re.match(r"^[a-z ]+$", bw):
+            pat = rf"\b{re.escape(bw)}\b"
+            if re.search(pat, req_low):
+                continue
+            if re.search(pat, cand_low):
+                return True
+        else:
+            if bw in req_low:
+                continue
+            if bw in cand_low:
+                return True
+    return False
+
+
 def check_duplicate(title: str, artist: str = ""):
     if os.path.exists(DB_OPS_SCRIPT):
         try:
@@ -174,7 +206,6 @@ def search_songs(keyword: str):
             data = json.loads(resp.read().decode("utf-8"))
             lists = data.get("data", {}).get("lists", [])
             results = []
-            default_cover = "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80"
             for item in lists:
                 s_name = item.get("SongName", "").replace("<em>", "").replace("</em>", "").replace("&nbsp;", " ").strip()
                 a_name = item.get("SingerName", "").replace("<em>", "").replace("</em>", "").replace("&nbsp;", " ").strip()
@@ -184,7 +215,7 @@ def search_songs(keyword: str):
                     "song_name": s_name,
                     "singer_name": a_name,
                     "album_name": alb_name,
-                    "cover": img if img else default_cover,
+                    "cover": img or "",
                     "hash": item.get("FileHash", ""),
                     "sq_hash": item.get("SQFileHash", "")
                 })
@@ -238,78 +269,46 @@ def get_netease_id(title: str, artist: str) -> str:
         pass
     return ""
 
-def resolve_stream_url_from_source(title: str, artist: str, source: str, quality_type: str) -> str:
-    """Resolve streaming URL via a specific platform source."""
-    kg_hash = get_kugou_hash(title, artist) if source == "kg" else ""
-    qq_mid = get_qq_mid(title, artist) if source == "tx" else ""
-    wy_id = get_netease_id(title, artist) if source == "wy" else ""
-    lx_source_json = json.dumps(os.path.abspath(LX_SOURCE))
+def batch_resolve_via_lx_runner(title: str, artist: str, attempts_spec: list) -> dict:
+    """Resolve and probe stream URL across candidate (source, quality) pairs in a single safe Node subprocess."""
+    if not attempts_spec or not os.path.exists(LX_RUNNER_SCRIPT):
+        return {}
+    needed_sources = {src for src, _ in attempts_spec}
+    kg_hash = get_kugou_hash(title, artist) if "kg" in needed_sources else ""
+    qq_mid = get_qq_mid(title, artist) if "tx" in needed_sources else ""
+    wy_id = get_netease_id(title, artist) if "wy" in needed_sources else ""
 
-    node_script = f"""
-    const fs = require('fs');
-    const vm = require('vm');
-    const crypto = require('crypto');
-    const code = fs.readFileSync({lx_source_json}, 'utf8');
-    let handlers = [];
-    const lx = {{
-      EVENT_NAMES: {{ request: 'request', inited: 'inited', updateAlert: 'updateAlert' }},
-      env: 'desktop', version: '2.0.0',
-      utils: {{ buffer: {{ from: (...a) => Buffer.from(...a) }}, crypto: {{ md5: (s) => crypto.createHash('md5').update(s).digest('hex') }} }},
-      request(url, opts, cb) {{
-        if (typeof opts === 'function') {{ cb = opts; opts = {{}}; }}
-        fetch(url, opts).then(async r => {{
-          let body;
-          const ct = r.headers.get('content-type') || '';
-          if (ct.includes('json')) body = await r.json().catch(() => r.text());
-          else body = await r.text();
-          cb(null, {{ statusCode: r.status, body, headers: Object.fromEntries(r.headers.entries()) }}, body);
-        }}).catch(err => cb(err));
-      }},
-      on(name, fn) {{ if (name === 'request') handlers.push(fn); }},
-      send() {{}}
-    }};
-    const sandbox = {{
-      console: {{ log(){{}}, warn(){{}}, error(){{}}, group(){{}}, groupEnd(){{}} }},
-      setTimeout, clearTimeout, setInterval, clearInterval,
-      Buffer, URL, module: {{ exports: {{}} }}, exports: {{}},
-      lx, globalThis: {{}}, global: {{}}
-    }};
-    sandbox.globalThis = sandbox; sandbox.global = sandbox; sandbox.globalThis.lx = lx;
-    vm.createContext(sandbox);
-    vm.runInContext(code, sandbox);
-    const sourceHandler = handlers[0];
+    attempts = []
+    for src, q_type in attempts_spec:
+        music_info = {"name": title, "singer": artist}
+        if src == "kg" and kg_hash:
+            music_info["hash"] = kg_hash
+        elif src == "tx" and qq_mid:
+            music_info["songmid"] = qq_mid
+        elif src == "wy" and wy_id:
+            music_info["id"] = wy_id
+        attempts.append({"source": src, "quality": q_type, "musicInfo": music_info})
 
-    async function run() {{
-      try {{
-        let musicInfo = {{ name: {json.dumps(title)}, singer: {json.dumps(artist)} }};
-        const src = '{source}';
-        if (src === 'kg' && '{kg_hash}') musicInfo.hash = '{kg_hash}';
-        if (src === 'tx' && '{qq_mid}') musicInfo.songmid = '{qq_mid}';
-        if (src === 'wy' && '{wy_id}') musicInfo.id = '{wy_id}';
-
-        const ret = await sourceHandler({{
-          action: 'musicUrl',
-          source: src,
-          info: {{ type: '{quality_type}', musicInfo }}
-        }});
-        const u = typeof ret === 'string' ? ret : ret?.url;
-        if (u) console.log(JSON.stringify({{ url: u, quality: '{quality_type}', source: src }}));
-        else console.log(JSON.stringify({{ error: 'no_url' }}));
-      }} catch(e) {{
-        console.log(JSON.stringify({{ error: e.message }}));
-      }}
-    }}
-    run();
-    """
+    payload = {
+        "lx_source_path": os.path.abspath(LX_SOURCE),
+        "attempts": attempts,
+        "probe": True,
+    }
     try:
-        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, timeout=20)
+        res = subprocess.run(
+            ["node", LX_RUNNER_SCRIPT],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
         output = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else "{}"
         data = json.loads(output)
         if data.get("url"):
-            return data["url"]
+            return data
     except Exception:
         pass
-    return None
+    return {}
 
 def resolve_custom_source_stream(title: str, artist: str, quality: str = "flac") -> str:
     """Resolve stream URL using user-configured custom API or custom script."""
@@ -398,148 +397,72 @@ def resolve_audio_stream(
     else:
         source_plan = ["kw", "kg", "tx", "wy"]
 
-    def probe_stream(test_url: str) -> bool:
-        try:
-            chk_req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(chk_req, timeout=10) as test_resp:
-                ct = (test_resp.headers.get("Content-Type") or "").lower()
-                if test_resp.status == 200 and not ("application/json" in ct or "text/html" in ct):
-                    return True
-                else:
-                    return False
-        except Exception:
-            return False
-
-    # 1. 尝试直接获取目标音质
-    for src in source_plan:
-        url = resolve_stream_url_from_source(title, artist, src, quality_type)
-        if url and probe_stream(url):
-            is_source_fallback = bool(requested_source and requested_source not in ("auto", "custom") and src != requested_source)
-            notes = []
-            if is_source_fallback:
-                req_name = SOURCE_NAMES.get(requested_source, requested_source.upper())
-                used_name = SOURCE_NAMES.get(src, src.upper())
-                notes.append(f"音源由{req_name}回退至{used_name}")
-
-            target_q = quality_type
-            quality_adj = False
-            if force_transcode:
-                actual_rank = QUALITY_RANKS.get(quality_type, 20)
-                target_rank = QUALITY_RANKS.get(transcode_quality, 20)
-                if actual_rank > target_rank:
-                    target_q = transcode_quality
-                    quality_adj = True
-                    notes.append(f"由{quality_type.upper()}转码至{transcode_quality.upper()}")
-                elif actual_rank < target_rank:
-                    notes.append(f"{quality_type.upper()}低于转码目标{transcode_quality.upper()}（跳过转码）")
-
-            note = " · ".join(notes)
-            if note:
-                print(f"  -> [音源/转码策略] {note}")
-            print(f"  -> Stream verified & successfully resolved from source: [{src.upper()}] ({quality_type.upper()})")
-            return {
-                "url": url,
-                "actual_quality": quality_type,
-                "target_quality": target_q,
-                "source_used": src,
-                "source_requested": requested_source,
-                "source_fallback": is_source_fallback,
-                "quality_adjusted": quality_adj,
-                "adjustment_note": note
-            }
-        elif url:
-            print(f"  -> Source [{src.upper()}] stream probe failed, trying next fallback...")
-
-    # 2. 如果目标是 128k 或 320k，未能直链解析到对应音质，向上寻找 320k 或 FLAC 音源
+    attempts_spec = [(src, quality_type) for src in source_plan]
     if quality_type not in ("flac", "flac24bit"):
         fallback_qualities = ["320k", "flac"] if quality_type == "128k" else ["flac"]
         for fq in fallback_qualities:
             for src in source_plan:
-                url = resolve_stream_url_from_source(title, artist, src, fq)
-                if url and probe_stream(url):
-                    is_source_fallback = bool(requested_source and requested_source not in ("auto", "custom") and src != requested_source)
-                    notes = []
-                    if is_source_fallback:
-                        req_name = SOURCE_NAMES.get(requested_source, requested_source.upper())
-                        used_name = SOURCE_NAMES.get(src, src.upper())
-                        notes.append(f"音源由{req_name}回退至{used_name}")
-                    
-                    if not force_transcode:
-                        notes.append(f"源站无{quality_type.upper()}，向上直通{fq.upper()}（免转码）")
-                        note = " · ".join(notes)
-                        print(f"  -> Stream verified from [{src.upper()}] ({fq.upper()}), direct download without transcoding: {note}")
-                        return {
-                            "url": url,
-                            "actual_quality": fq,
-                            "target_quality": fq,
-                            "source_used": src,
-                            "source_requested": requested_source,
-                            "source_fallback": is_source_fallback,
-                            "quality_adjusted": True,
-                            "adjustment_note": note
-                        }
-                    else:
-                        actual_rank = QUALITY_RANKS.get(fq, 30)
-                        target_rank = QUALITY_RANKS.get(transcode_quality, 20)
-                        if actual_rank > target_rank:
-                            target_q = transcode_quality
-                            notes.append(f"源站无{quality_type.upper()}，获取{fq.upper()}并转码至{transcode_quality.upper()}")
-                        else:
-                            target_q = fq
-                            notes.append(f"源站无{quality_type.upper()}，获取{fq.upper()}（低于或等于转码目标，跳过转码）")
-                        note = " · ".join(notes)
-                        print(f"  -> Stream verified from [{src.upper()}] ({fq.upper()}): {note}")
-                        return {
-                            "url": url,
-                            "actual_quality": fq,
-                            "target_quality": target_q,
-                            "source_used": src,
-                            "source_requested": requested_source,
-                            "source_fallback": is_source_fallback,
-                            "quality_adjusted": True,
-                            "adjustment_note": note
-                        }
-
-    # 3. 如果目标是 flac/flac24bit，但所有源都没有无损（只有更低音源），向下寻找 flac/320k/128k 降级保存
-    if quality_type in ("flac", "flac24bit"):
+                attempts_spec.append((src, fq))
+    else:
         lower_qualities = ["flac", "320k", "128k"] if quality_type == "flac24bit" else ["320k", "128k"]
         for lq in lower_qualities:
             for src in source_plan:
-                url = resolve_stream_url_from_source(title, artist, src, lq)
-                if url and probe_stream(url):
-                    is_source_fallback = bool(requested_source and requested_source not in ("auto", "custom") and src != requested_source)
-                    notes = []
-                    if is_source_fallback:
-                        req_name = SOURCE_NAMES.get(requested_source, requested_source.upper())
-                        used_name = SOURCE_NAMES.get(src, src.upper())
-                        notes.append(f"音源由{req_name}回退至{used_name}")
+                attempts_spec.append((src, lq))
 
-                    actual_rank = QUALITY_RANKS.get(lq, 20)
-                    target_rank = QUALITY_RANKS.get(transcode_quality, 20)
-                    if force_transcode and actual_rank > target_rank:
-                        target_q = transcode_quality
-                        notes.append(f"无损未收录获取{lq.upper()}，转码至{transcode_quality.upper()}")
-                    elif force_transcode and actual_rank < target_rank:
-                        target_q = lq
-                        notes.append(f"无损未收录降级为{lq.upper()}（低于转码目标{transcode_quality.upper()}，跳过转码）")
-                    else:
-                        target_q = lq
-                        notes.append(f"无损未收录，降级为{lq.upper()}")
+    resolved = batch_resolve_via_lx_runner(title, artist, attempts_spec)
+    if resolved and resolved.get("url"):
+        url = resolved["url"]
+        src = resolved.get("source") or source_plan[0]
+        actual_q = resolved.get("quality") or quality_type
+        is_source_fallback = bool(requested_source and requested_source not in ("auto", "custom") and src != requested_source)
+        notes = []
+        if is_source_fallback:
+            req_name = SOURCE_NAMES.get(requested_source, requested_source.upper())
+            used_name = SOURCE_NAMES.get(src, src.upper())
+            notes.append(f"音源由{req_name}回退至{used_name}")
 
-                    note = " · ".join(notes)
-                    print(f"  -> [只有更低音源] {note}")
-                    print(f"  -> Stream verified & successfully resolved from source: [{src.upper()}] ({lq.upper()})")
-                    return {
-                        "url": url,
-                        "actual_quality": lq,
-                        "target_quality": target_q,
-                        "source_used": src,
-                        "source_requested": requested_source,
-                        "source_fallback": is_source_fallback,
-                        "quality_adjusted": True,
-                        "adjustment_note": note
-                    }
+        target_q = actual_q
+        quality_adj = actual_q != quality_type
+        actual_rank = QUALITY_RANKS.get(actual_q, 20)
+        target_rank = QUALITY_RANKS.get(transcode_quality, 20)
 
+        if actual_q == quality_type:
+            if force_transcode:
+                if actual_rank > target_rank:
+                    target_q = transcode_quality
+                    quality_adj = True
+                    notes.append(f"由{actual_q.upper()}转码至{transcode_quality.upper()}")
+                elif actual_rank < target_rank:
+                    notes.append(f"{actual_q.upper()}低于转码目标{transcode_quality.upper()}（跳过转码）")
+        elif QUALITY_RANKS.get(actual_q, 20) > QUALITY_RANKS.get(quality_type, 20):
+            if not force_transcode:
+                notes.append(f"源站无{quality_type.upper()}，向上直通{actual_q.upper()}（免转码）")
+            elif actual_rank > target_rank:
+                target_q = transcode_quality
+                notes.append(f"源站无{quality_type.upper()}，获取{actual_q.upper()}并转码至{transcode_quality.upper()}")
+            else:
+                notes.append(f"源站无{quality_type.upper()}，获取{actual_q.upper()}（低于或等于转码目标，跳过转码）")
+        else:
+            if force_transcode and actual_rank > target_rank:
+                target_q = transcode_quality
+                notes.append(f"高音质未收录获取{actual_q.upper()}，转码至{transcode_quality.upper()}")
+            else:
+                notes.append(f"高音质未收录，降级为{actual_q.upper()}")
+
+        note = " · ".join(notes)
+        if note:
+            print(f"  -> [音源/转码策略] {note}")
+        print(f"  -> Stream verified & successfully resolved from source: [{src.upper()}] ({actual_q.upper()})")
+        return {
+            "url": url,
+            "actual_quality": actual_q,
+            "target_quality": target_q,
+            "source_used": src,
+            "source_requested": requested_source,
+            "source_fallback": is_source_fallback,
+            "quality_adjusted": quality_adj,
+            "adjustment_note": note,
+        }
     return None
 
 def get_flac_url(title: str, artist: str, quality: str = "flac", source: str = None) -> str:
@@ -688,6 +611,32 @@ def embed_flac_metadata(filepath: str, title: str, artist: str, album: str, date
     subprocess.run(cmd, env=env, check=True)
 
 
+def normalize_cover_image(cover_path: str) -> bool:
+    """Ensure cover art is standard JPEG or PNG so metaflac and ffmpeg ID3 APIC never fail on WebP."""
+    if not cover_path or not os.path.exists(cover_path) or os.path.getsize(cover_path) <= 512:
+        return False
+    try:
+        with open(cover_path, "rb") as f:
+            header = f.read(16)
+        is_jpeg = len(header) >= 3 and header[:3] == b"\xff\xd8\xff"
+        is_png = len(header) >= 8 and header[:8] == b"\x89PNG\r\n\x1a\n"
+        if is_jpeg or is_png:
+            return True
+        converted = cover_path + ".converted.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", cover_path, "-frames:v", "1", "-q:v", "2", converted],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        if os.path.exists(converted) and os.path.getsize(converted) > 512:
+            safe_move(converted, cover_path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def embed_mp3_metadata(filepath: str, title: str, artist: str, album: str, date: str, cover_path: str = None, lyrics: str = None):
     """Write ID3 metadata for MP3 without re-encoding the audio stream."""
     fd, tagged_path = tempfile.mkstemp(suffix=".mp3")
@@ -794,6 +743,9 @@ def process_song_download(
     else:
         album = sanitize_text(album)
 
+    safe_artist = sanitize_filename_part(artist, "未知歌手")
+    safe_title = sanitize_filename_part(title, "未知曲目")
+
     used_source = source or load_default_source()
     print(f"=== [TRIM Music Hub] Processing: {artist} - {title} (Quality: {quality.upper()}, Source: {used_source.upper()}, ForceTranscode: {force_transcode}, TranscodeQuality: {transcode_quality.upper() if force_transcode else 'PASSTHROUGH'}) ===")
 
@@ -808,8 +760,7 @@ def process_song_download(
     target_item = None
     for item in search_res:
         name = item.get("song_name", "")
-        name_lower = name.lower()
-        if any(bw in name_lower for bw in BANNED_KEYWORDS):
+        if has_unwanted_keyword(name, title):
             continue
         target_item = item
         break
@@ -848,9 +799,9 @@ def process_song_download(
     adjustment_note = stream_info.get("adjustment_note", "")
 
     # 4. Prepare directories and handle post-download transcoding rules.
-    artist_dir = os.path.join(MUSIC_ROOT, artist)
-    song_dir = os.path.join(artist_dir, f"{artist} - {title}")
-    os.makedirs(song_dir, exist_ok=True)
+    artist_dir = os.path.join(MUSIC_ROOT, safe_artist)
+    song_dir = os.path.join(artist_dir, f"{safe_artist} - {safe_title}")
+    os.makedirs(song_dir, mode=0o775, exist_ok=True)
     effective_save_quality = target_quality
     output_ext = "flac" if effective_save_quality in ("flac", "flac24bit") else "mp3"
 
@@ -942,16 +893,15 @@ def process_song_download(
                 if t_note not in adjustment_note:
                     adjustment_note = f"{adjustment_note} · {t_note}" if adjustment_note else t_note
 
-        final_audio_path = os.path.join(song_dir, f"{artist} - {title}.{output_ext}")
+        final_audio_path = os.path.join(song_dir, f"{safe_artist} - {safe_title}.{output_ext}")
 
-        # Download cover
+        # Download & normalize cover (converting WebP to JPEG if needed)
         has_cover = False
         if cover_url:
             try:
                 print(f"  -> Downloading cover art: {cover_url[:60]}...")
                 download_file(cover_url, tmp_cover)
-                if os.path.getsize(tmp_cover) > 1024:
-                    has_cover = True
+                has_cover = normalize_cover_image(tmp_cover)
             except Exception as e:
                 print(f"  -> Cover download failed: {e}")
 
@@ -963,33 +913,52 @@ def process_song_download(
         # Inject metadata & cover & lyrics using the container matching the output format.
         print(f"  -> Injecting metadata tags, cover art & lyrics into {output_ext.upper()}...")
         metadata_fn = embed_flac_metadata if output_ext == "flac" else embed_mp3_metadata
-        metadata_fn(
-            tmp_music,
-            title=title,
-            artist=artist,
-            album=album,
-            date="",
-            cover_path=tmp_cover if has_cover else None,
-            lyrics=lyrics_text if lyrics_text else None
-        )
+        try:
+            metadata_fn(
+                tmp_music,
+                title=title,
+                artist=artist,
+                album=album,
+                date="",
+                cover_path=tmp_cover if has_cover else None,
+                lyrics=lyrics_text if lyrics_text else None
+            )
+        except Exception as tag_err:
+            if has_cover:
+                print(f"  -> Cover embedding failed ({tag_err}), retrying metadata without picture...")
+                has_cover = False
+                metadata_fn(
+                    tmp_music,
+                    title=title,
+                    artist=artist,
+                    album=album,
+                    date="",
+                    cover_path=None,
+                    lyrics=lyrics_text if lyrics_text else None
+                )
+            else:
+                raise
 
         safe_move(tmp_music, final_audio_path)
 
     # Save .lrc file if lyrics found
     if lyrics_text:
-        lrc_path = os.path.join(song_dir, f"{artist} - {title}.lrc")
+        lrc_path = os.path.join(song_dir, f"{safe_artist} - {safe_title}.lrc")
         try:
             with open(lrc_path, "w", encoding="utf-8") as f:
                 f.write(lyrics_text)
-            os.chmod(lrc_path, 0o777)
+            os.chmod(lrc_path, 0o664)
             print(f"  -> Saved sibling LRC lyrics file: {lrc_path}")
         except Exception as e:
             print(f"  -> Error saving LRC file: {e}")
 
-    # Set permissions
+    # Set permissions safely without world-writable 777
     try:
-        subprocess.run(["chown", "-R", f"{PUID}:{PGID}", artist_dir], stderr=subprocess.DEVNULL)
-        subprocess.run(["chmod", "-R", "777", artist_dir], stderr=subprocess.DEVNULL)
+        subprocess.run(["chown", "-R", f"{PUID}:{PGID}", song_dir], stderr=subprocess.DEVNULL)
+        os.chmod(artist_dir, 0o775)
+        os.chmod(song_dir, 0o775)
+        if os.path.exists(final_audio_path):
+            os.chmod(final_audio_path, 0o664)
     except Exception:
         pass
 

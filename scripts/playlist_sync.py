@@ -25,10 +25,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.abspath(os.environ.get("DATA_DIR") or os.path.join(PROJECT_DIR, "data"))
 MUSIC_MANAGER = os.path.join(SCRIPT_DIR, "music_manager.py")
-SETTINGS_FILE = os.path.join(PROJECT_DIR, "data", "settings.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
-DEFAULT_MUSIC = "/media/music" if os.path.exists("/media/music") else "/vol2/1000/媒体/音乐"
+DEFAULT_MUSIC = "/media/music" if os.path.exists("/media/music") else "/vol1/1000/Music"
 
 def load_effective_music_dir() -> str:
     if os.path.exists(SETTINGS_FILE):
@@ -51,15 +52,32 @@ DB_PATH = os.environ.get("FNOS_DB_PATH") or os.path.join(DB_DIR, "music.db")
 
 DEFAULT_COVER_DIR = "/app/cover" if os.path.exists("/app/cover") else "/vol1/@appmeta/trim.music/cover"
 COVER_DIR = os.environ.get("FNOS_COVER_DIR", DEFAULT_COVER_DIR)
+FALLBACK_COVER_DIR = os.path.join(DATA_DIR, "covers")
 
 MONITOR_PORT = os.environ.get("PORT", "4175")
 MONITOR_URL = f"http://127.0.0.1:{MONITOR_PORT}/api/update-status"
+INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "")
 
 PUID = os.environ.get("PUID", "1000")
 PGID = os.environ.get("PGID", "1000")
 
 USER_AGENTS = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-THIRD_PARTY_COOKIE = os.environ.get("THIRD_PARTY_COOKIE", "").strip()
+
+
+def sanitize_cookie_header(raw_cookie: str) -> str:
+    if not raw_cookie:
+        return ""
+    parts = []
+    for line in str(raw_cookie).replace("\r", "\n").split("\n"):
+        s = line.strip().strip(";")
+        if s:
+            parts.append(s)
+    joined = "; ".join(parts)
+    return re.sub(r"[\x00-\x1f\x7f]", "", joined).strip()
+
+
+THIRD_PARTY_COOKIE = sanitize_cookie_header(os.environ.get("THIRD_PARTY_COOKIE", ""))
+
 
 def resolve_real_url(raw_text: str) -> str:
     """Extract and resolve short links or redirects."""
@@ -86,7 +104,7 @@ def parse_netease_playlist(url: str):
     headers = {
         "User-Agent": USER_AGENTS,
         "Referer": "https://music.163.com/",
-        "Cookie": THIRD_PARTY_COOKIE or "os=pc; osver=Microsoft-Windows-10-Professional-build-19042-64bit; appver=2.9.7;"
+        "Cookie": sanitize_cookie_header(THIRD_PARTY_COOKIE) or "os=pc; osver=Microsoft-Windows-10-Professional-build-19042-64bit; appver=2.9.7;"
     }
     try:
         req = urllib.request.Request(api_url, headers=headers)
@@ -189,8 +207,10 @@ def parse_qq_playlist(url: str, raw_input: str = ''):
             headers = {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.48(0x1800302c) NetType/WIFI Language/zh_CN',
                 'Referer': 'https://i2.y.qq.com/n3/other/pages/details/playlist.html',
-                'Cookie': THIRD_PARTY_COOKIE
             }
+            clean_ck = sanitize_cookie_header(THIRD_PARTY_COOKIE)
+            if clean_ck:
+                headers['Cookie'] = clean_ck
             req = urllib.request.Request(u_api, data=json.dumps(payload).encode('utf-8'), headers=headers)
             with urllib.request.urlopen(req, timeout=12) as resp:
                 res_data = json.loads(resp.read().decode('utf-8'))
@@ -320,12 +340,51 @@ def parse_playlist_url(raw_input: str):
         return parse_qq_playlist(real_url, raw_input=raw_input)
     return None
 
+def _load_soft_deleted_paths_set() -> set:
+    deleted_paths = set()
+    if not os.path.exists(DB_PATH):
+        return deleted_paths
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT af.path
+            FROM track t
+            JOIN audio_file af ON t.audio_file_id = af.id
+            WHERE (t.is_admin_deleted != 0 OR t.is_audio_file_deleted != 0)
+              AND af.path IS NOT NULL
+            """
+        )
+        for row in c.fetchall():
+            if row[0]:
+                norm_p = os.path.normpath(row[0])
+                deleted_paths.add(norm_p)
+                deleted_paths.add(os.path.basename(norm_p).lower())
+    except Exception:
+        pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return deleted_paths
+
+
 def build_local_library_index():
-    """Scan local music directory once to build an in-memory index for fast matching."""
+    """Scan local music directory once to build an in-memory index, strictly excluding soft-deleted paths."""
     index = set()
     files_map = {}
     if not os.path.exists(MUSIC_ROOT):
         return index, files_map
+
+    soft_deleted = _load_soft_deleted_paths_set()
+
+    def _is_excluded(fpath: str) -> bool:
+        norm_p = os.path.normpath(fpath)
+        return norm_p in soft_deleted or os.path.basename(norm_p).lower() in soft_deleted
 
     try:
         for artist_entry in os.scandir(MUSIC_ROOT):
@@ -335,7 +394,9 @@ def build_local_library_index():
                 s_name = song_entry.name.lower().strip()
                 if song_entry.is_dir():
                     for f in os.scandir(song_entry.path):
-                        if f.name.endswith((".flac", ".mp3", ".alac", ".wav", ".m4a")):
+                        if f.name.lower().endswith((".flac", ".mp3", ".alac", ".wav", ".m4a")):
+                            if _is_excluded(f.path):
+                                continue
                             files_map[s_name] = f.path
                             index.add(s_name)
                             parts = s_name.split(" - ")
@@ -347,7 +408,9 @@ def build_local_library_index():
                                 index.add(combo)
                                 files_map[combo] = f.path
                             break
-                elif song_entry.is_file():
+                elif song_entry.is_file() and song_entry.name.lower().endswith((".flac", ".mp3", ".alac", ".wav", ".m4a")):
+                    if _is_excluded(song_entry.path):
+                        continue
                     base = os.path.splitext(s_name)[0].strip()
                     index.add(base)
                     files_map[base] = song_entry.path
@@ -358,11 +421,10 @@ def build_local_library_index():
 LOCAL_INDEX, LOCAL_FILES = None, None
 
 def check_track_exists(title: str, artist: str):
-    # 1. 优先调用 db_ops 智能查重引擎（支持艺人双向多别名、多专辑合集及音质打分）
+    # 1. 优先调用 db_ops 智能查重引擎（已排除 is_admin_deleted != 0 的软删除曲目）
     try:
-        hub_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if hub_root not in sys.path:
-            sys.path.insert(0, hub_root)
+        if PROJECT_DIR not in sys.path:
+            sys.path.insert(0, PROJECT_DIR)
         import db_ops
         chk = db_ops.check_song_exists(title, artist)
         if chk and chk.get("exists") and chk.get("path") and os.path.exists(chk["path"]):
@@ -398,18 +460,12 @@ def check_track_exists(title: str, artist: str):
             if target_ver == fpath_ver:
                 return {"exists": True, "path": fpath}
 
-    direct_dir = os.path.join(MUSIC_ROOT, artist.split("/")[0].strip(), f"{artist.split('/')[0].strip()} - {title.strip()}")
-    if os.path.exists(direct_dir):
-        for f in os.listdir(direct_dir):
-            if f.endswith((".flac", ".mp3", ".alac", ".wav", ".m4a")):
-                return {"exists": True, "path": os.path.join(direct_dir, f)}
-
     return {"exists": False, "path": ""}
 
 def download_single_track(artist: str, title: str, album: str = None, quality: str = "flac", source: str = "", force_transcode: bool = False, transcode_quality: str = None):
     cmd = [
         sys.executable, MUSIC_MANAGER,
-        "--artist", artist.split("/")[0].strip(),
+        "--artist", artist.strip() or "未知歌手",
         "--song", title,
         "--quality", quality
     ]
@@ -463,36 +519,59 @@ def download_single_track(artist: str, title: str, album: str = None, quality: s
         print(f"  -> Subprocess error ({retcode}): {err}")
     return False, "", {}
 
-def generate_m3u8(playlist_name: str, tracks: list):
-    os.makedirs(PLAYLIST_DIR, exist_ok=True)
-    filename = f"{playlist_name}.m3u8"
-    filepath = os.path.join(PLAYLIST_DIR, filename)
+def _sanitize_m3u_name(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip()
+    cleaned = cleaned.replace("..", "_").strip(". ")
+    return cleaned or "未命名歌单"
 
-    lines = ["#EXTM3U\n"]
+
+def generate_m3u8(playlist_name: str, tracks: list, target_mode: str = "public", target_user: str = ""):
+    os.makedirs(PLAYLIST_DIR, mode=0o775, exist_ok=True)
+    safe_name = _sanitize_m3u_name(playlist_name)
+    safe_user = _sanitize_m3u_name(target_user) if target_user else ""
+    filepath = os.path.join(PLAYLIST_DIR, f"{safe_name}.m3u8")
+
+    # 防止不同用户的同名私有歌单覆盖公共或其他成员的 .m3u8 文件
+    if target_mode == "user" and safe_user and os.path.exists(filepath):
+        user_specific = os.path.join(PLAYLIST_DIR, f"{safe_name} ({safe_user}).m3u8")
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as ef:
+                head = ef.read(256)
+            if f"#OWNER:{target_user}" not in head:
+                filepath = user_specific
+        except Exception:
+            filepath = user_specific
+
+    owner_tag = f"#OWNER:{target_user}\n" if target_mode == "user" and target_user else "#OWNER:public\n"
+    lines = ["#EXTM3U\n", f"#PLAYLIST:{playlist_name}\n", owner_tag, "\n"]
     for t in tracks:
         p = t.get("path")
         if p and os.path.exists(p):
             lines.append(f"#EXTINF:-1,{t.get('artist')} - {t.get('title')}\n")
-            lines.append(f"{p}\n")
+            try:
+                rel_p = os.path.relpath(p, PLAYLIST_DIR)
+            except ValueError:
+                rel_p = p
+            lines.append(f"{rel_p}\n")
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.writelines(lines)
     try:
-        os.chmod(filepath, 0o777)
-        subprocess.run(["chown", "-R", f"{PUID}:{PGID}", PLAYLIST_DIR], stderr=subprocess.DEVNULL)
+        os.chmod(filepath, 0o664)
+        subprocess.run(["chown", f"{PUID}:{PGID}", filepath], stderr=subprocess.DEVNULL)
     except Exception:
         pass
     return filepath
 
 def import_playlist_cover(cover_url: str) -> str:
-    """Download cover image from playlist URL and import into fnOS @appmeta structure."""
-    if not cover_url:
+    """Download cover image from playlist URL and import into fnOS @appmeta structure (with safe fallback to DATA_DIR/covers)."""
+    if not cover_url or not str(cover_url).startswith("http"):
         return ""
     cover_guid = uuid.uuid4().hex
     prefix = cover_guid[:2]
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
-        src_img = os.path.join(tmpdir, "src.jpg")
+        src_img = os.path.join(tmpdir, "src.img")
         out_webp = os.path.join(tmpdir, cover_guid)
         w120 = os.path.join(tmpdir, f"{cover_guid}_w120.jpg")
         w160 = os.path.join(tmpdir, f"{cover_guid}_w160.jpg")
@@ -505,29 +584,34 @@ def import_playlist_cover(cover_url: str) -> str:
                 f.write(resp.read())
 
             subprocess.run(["ffmpeg", "-y", "-i", src_img, "-c:v", "libwebp", "-f", "webp", out_webp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", "scale=120:-1", w120], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", "scale=160:-1", w160], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", "scale=400:-1", w400], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", "scale=600:-1", w600], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", "scale=800:-1", w800], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            for width, out_file in [(120, w120), (160, w160), (400, w400), (600, w600), (800, w800)]:
+                subprocess.run(["ffmpeg", "-y", "-i", src_img, "-vf", f"scale={width}:-1", out_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            target_dir = os.path.join(COVER_DIR, "playlist", prefix)
-            try:
-                os.makedirs(target_dir, exist_ok=True)
-                for fname in [cover_guid, w120, w160, w400, w600, w800]:
-                    base_name = os.path.basename(fname)
-                    dst_path = os.path.join(target_dir, base_name)
-                    shutil.copyfile(os.path.join(tmpdir, base_name), dst_path)
-                    try:
-                        os.chmod(dst_path, 0o644)
-                    except Exception:
-                        pass
-            except PermissionError:
-                cmd = f"sudo mkdir -p {target_dir} && sudo cp {tmpdir}/* {target_dir}/ && sudo chmod 644 {target_dir}/*"
-                subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            generated_files = [out_webp, w120, w160, w400, w600, w800]
+            wrote_any = False
+            for root_base in [COVER_DIR, FALLBACK_COVER_DIR]:
+                if not root_base:
+                    continue
+                target_dir = os.path.join(root_base, "playlist", prefix)
+                try:
+                    os.makedirs(target_dir, mode=0o775, exist_ok=True)
+                    for src_file in generated_files:
+                        base_name = os.path.basename(src_file)
+                        dst_path = os.path.join(target_dir, base_name)
+                        shutil.copyfile(src_file, dst_path)
+                        try:
+                            os.chmod(dst_path, 0o644)
+                        except Exception:
+                            pass
+                    wrote_any = True
+                    break
+                except OSError:
+                    continue
 
-            print(f"🖼️ [Cover Imported]: 成功导入歌单官方高清封面 [GUID: {cover_guid}]")
-            return cover_guid
+            if wrote_any:
+                print(f"🖼️ [Cover Imported]: 成功导入歌单高清封面 [GUID: {cover_guid}]")
+                return cover_guid
+            return ""
         except Exception as e:
             print(f"[Cover Import Error]: {e}", file=sys.stderr)
             return ""
@@ -663,34 +747,59 @@ def sync_to_fnos_db(playlist_name: str, target_mode: str, target_user: str, all_
 
         matched_track_ids = resolve_track_ids(conn, c, all_synced, wait_seconds=8)
 
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S.000000000+08:00')
+        now = db_ops.now_cn_str()
+        existing_groups = db_ops._build_logical_playlists(c)
+        matched_group = None
+        if target_mode == 'public':
+            for g in existing_groups:
+                if g.get("is_public") and g.get("name") == playlist_name:
+                    matched_group = g
+                    break
+        elif len(users) == 1:
+            target_uid = int(users[0][0])
+            for g in existing_groups:
+                if not g.get("is_public") and g.get("user_ids") == [target_uid] and g.get("name") == playlist_name:
+                    matched_group = g
+                    break
+
+        existing_pid_by_uid = {}
+        if matched_group:
+            group_pids = matched_group.get("playlist_ids") or []
+            if group_pids:
+                ph = ",".join("?" for _ in group_pids)
+                c.execute(f"SELECT id, user_id FROM playlist WHERE id IN ({ph});", group_pids)
+                for r_pid, r_uid in c.fetchall():
+                    existing_pid_by_uid[int(r_uid)] = int(r_pid)
 
         created_count = 0
         total_tracks_added = 0
+        synced_pids = []
         for u_id, u_name in users:
-            pl_guid = uuid.uuid4().hex
-            c.execute("SELECT id, cover_guid FROM playlist WHERE name=? AND user_id=?;", (playlist_name, u_id))
-            existing_pl = c.fetchone()
-            if existing_pl:
-                pl_id = existing_pl[0]
+            uid_int = int(u_id)
+            pl_id = existing_pid_by_uid.get(uid_int)
+            if pl_id:
                 if cover_guid:
                     db_ops.safe_update(c, "playlist", {"cover_guid": cover_guid, "updated_at": now}, "id = ?", [pl_id])
             else:
+                pl_guid = uuid.uuid4().hex
                 pl_id = db_ops.safe_insert(c, "playlist", {
                     "guid": pl_guid,
                     "name": playlist_name,
                     "cover_guid": cover_guid or "",
-                    "user_id": u_id,
+                    "user_id": uid_int,
                     "created_at": now,
                     "updated_at": now
                 })
                 created_count += 1
 
+            if pl_id:
+                synced_pids.append(int(pl_id))
+
             for tid in matched_track_ids:
                 c.execute("SELECT id FROM playlist_track WHERE playlist_id=? AND track_id=?;", (pl_id, tid))
                 if not c.fetchone():
                     db_ops.safe_insert(c, "playlist_track", {
-                        "user_id": u_id,
+                        "user_id": uid_int,
                         "playlist_id": pl_id,
                         "track_id": tid,
                         "added_at": now,
@@ -700,6 +809,8 @@ def sync_to_fnos_db(playlist_name: str, target_mode: str, target_user: str, all_
                     total_tracks_added += 1
 
         conn.commit()
+        if synced_pids:
+            db_ops.register_playlist_group(synced_pids, is_public=(target_mode == 'public'))
         print(f"✅ fnOS 数据库已绑定: 歌单《{playlist_name}》关联用户数={len(users)}, 成功添加歌曲={len(matched_track_ids)}首, 封面GUID={cover_guid or '无'}")
         return created_count
     except Exception as e:
@@ -719,10 +830,13 @@ def sync_to_fnos_db(playlist_name: str, target_mode: str, target_user: str, all_
 
 def push_monitor_update(task_data: dict):
     try:
+        headers = {"Content-Type": "application/json"}
+        if INTERNAL_API_TOKEN:
+            headers["X-Internal-Token"] = INTERNAL_API_TOKEN
         req = urllib.request.Request(
             MONITOR_URL,
             data=json.dumps(task_data).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            headers=headers
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             pass
@@ -730,23 +844,34 @@ def push_monitor_update(task_data: dict):
         pass
 
 def main():
+    global THIRD_PARTY_COOKIE
     parser = argparse.ArgumentParser(description="TRIM Music Hub Playlist Sync")
     parser.add_argument("--url", required=True, help="Playlist URL or share text")
     parser.add_argument("--parse-only", action="store_true", help="Only parse the playlist and print JSON")
+    parser.add_argument("--cookie-stdin", action="store_true", help="Read third-party cookie safely from stdin")
     parser.add_argument("--tracks-file", default="", help="JSON file containing the selected tracks")
     parser.add_argument("--playlist-name", default="", help="Override playlist name")
     parser.add_argument("--cover-url", default="", help="Override cover image URL")
     parser.add_argument("--target", default="public", choices=["public", "user"], help="Target playlist type (public/user)")
     parser.add_argument("--user", default="admin", help="Target fnOS user if target=user")
-    parser.add_argument("--quality", default="flac", choices=["flac", "320k", "128k"], help="Download quality")
+    parser.add_argument("--quality", default="flac", choices=["flac24bit", "flac", "320k", "128k"], help="Download quality")
     parser.add_argument("--source", default="", choices=["", "kw", "kg", "tx", "wy", "auto", "custom"], help="Download source")
     parser.add_argument("--force-transcode", action="store_true", help="Force audio transcoding via CPU if format differs")
-    parser.add_argument("--transcode-quality", default=None, choices=["flac", "320k", "128k"], help="Target transcode quality")
+    parser.add_argument("--transcode-quality", default=None, choices=["flac24bit", "flac", "320k", "128k"], help="Target transcode quality")
     parser.add_argument("--concurrency", type=int, default=5, help="Concurrent download threads (1-10)")
     parser.add_argument("--check-only", action="store_true", help="Only analyze and deduplicate, do not download")
     args = parser.parse_args()
 
-    print(f"=== [TRIM Music Hub] Starting Playlist Sync ===")
+    if args.cookie_stdin:
+        try:
+            stdin_cookie = sys.stdin.read()
+            if stdin_cookie:
+                THIRD_PARTY_COOKIE = sanitize_cookie_header(stdin_cookie)
+        except Exception:
+            pass
+
+    if not args.parse_only:
+        print("=== [TRIM Music Hub] Starting Playlist Sync ===")
     parsed = parse_playlist_url(args.url)
     if not parsed:
         if args.tracks_file and os.path.exists(args.tracks_file):
@@ -763,7 +888,7 @@ def main():
                 "tracks": []
             }
         else:
-            print("❌ Error: Unable to parse playlist URL. Please ensure it is a valid NetEase or QQ Music link.")
+            print("❌ Error: Unable to parse playlist URL. Please ensure it is a valid NetEase or QQ Music link.", file=sys.stderr if args.parse_only else sys.stdout)
             sys.exit(1)
 
     if args.parse_only:
@@ -792,31 +917,54 @@ def main():
     concurrency = max(1, min(10, args.concurrency or 5))
     print(f"📋 Playlist: 《{playlist_name}》 [{platform}], Total: {total} tracks, Concurrency: {concurrency}")
 
-    # Fast duplicate check
+    # Fast O(N) bulk duplicate check
     reused = []
     to_download = []
-    for t in raw_tracks:
+    need_check_indices = []
+    need_check_payload = []
+
+    for idx, t in enumerate(raw_tracks):
         track_path = t.get("path") or t.get("local_path")
         if track_path and os.path.exists(track_path):
-            chk = {"exists": True, "path": track_path}
-        else:
-            chk = check_track_exists(t["title"], t["artist"])
-        if chk["exists"]:
             t["status"] = "reused"
-            t["path"] = chk["path"]
+            t["path"] = track_path
             reused.append(t)
         else:
-            t["status"] = "pending"
-            to_download.append(t)
+            need_check_indices.append(idx)
+            need_check_payload.append({"title": t.get("title", ""), "artist": t.get("artist", "")})
+
+    if need_check_payload:
+        batch_results = None
+        try:
+            if PROJECT_DIR not in sys.path:
+                sys.path.insert(0, PROJECT_DIR)
+            import db_ops
+            batch_results = db_ops.batch_check_songs(need_check_payload)
+        except Exception:
+            batch_results = None
+
+        for pos, orig_idx in enumerate(need_check_indices):
+            t = raw_tracks[orig_idx]
+            if batch_results and pos < len(batch_results):
+                chk = batch_results[pos]
+            else:
+                chk = check_track_exists(t.get("title", ""), t.get("artist", ""))
+            if chk and chk.get("exists"):
+                t["status"] = "reused"
+                t["path"] = chk.get("path", "")
+                reused.append(t)
+            else:
+                t["status"] = "pending"
+                to_download.append((orig_idx, t))
 
     print(f"⚡ Deduplication Result: Local Reused {len(reused)} | Need Download {len(to_download)}")
 
     if args.check_only:
-        m3u_file = generate_m3u8(playlist_name, reused)
+        m3u_file = generate_m3u8(playlist_name, reused, target_mode=args.target, target_user=args.user)
         print(f"✅ Preview M3U8 generated: {m3u_file}")
         sys.exit(0)
 
-    # Initial monitor task state
+    # Initial monitor task state (full tracks snapshot sent once at start)
     task_state = {
         "status": "downloading",
         "playlist_name": playlist_name,
@@ -841,9 +989,14 @@ def main():
     failed = []
     state_lock = threading.Lock()
 
-    def process_item(item_index, t):
+    def build_incremental_payload(orig_idx: int, track_obj: dict) -> dict:
+        base = {k: v for k, v in task_state.items() if k != "tracks"}
+        base["track_update"] = {"index": orig_idx, "track": dict(track_obj)}
+        return base
+
+    def process_item(dl_index, orig_idx, t):
         track_quality = str(t.get("quality") or args.quality or "flac").lower().strip()
-        if track_quality not in ("flac", "320k", "128k"):
+        if track_quality not in ("flac24bit", "flac", "320k", "128k"):
             track_quality = args.quality or "flac"
         t["status"] = "downloading"
 
@@ -856,9 +1009,10 @@ def main():
                 "cover": t.get("cover", "")
             }
             task_state["processed_count"] = len(reused) + len(downloaded) + len(failed)
-            push_monitor_update(task_state)
+            start_payload = build_incremental_payload(orig_idx, t)
+        push_monitor_update(start_payload)
 
-        print(f"[{item_index+1}/{len(to_download)}] Downloading: {t['artist']} - {t['title']} [{track_quality}]...")
+        print(f"[{dl_index+1}/{len(to_download)}] Downloading: {t['artist']} - {t['title']} [{track_quality}]...")
         ok, p, meta = download_single_track(
             t['artist'],
             t['title'],
@@ -893,20 +1047,30 @@ def main():
                 print(f"  -> ⚠️ Failed or invalid stream: {t['artist']} - {t['title']}")
 
             task_state["processed_count"] = len(reused) + len(downloaded) + len(failed)
-            push_monitor_update(task_state)
+            done_payload = build_incremental_payload(orig_idx, t)
+        push_monitor_update(done_payload)
 
     if to_download:
         if concurrency > 1 and len(to_download) > 1:
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(process_item, idx, t) for idx, t in enumerate(to_download)]
+                futures = [executor.submit(process_item, idx, orig_idx, t) for idx, (orig_idx, t) in enumerate(to_download)]
                 for f in as_completed(futures):
                     try:
                         f.result()
                     except Exception as e:
                         print(f"[Worker Exception]: {e}", file=sys.stderr)
         else:
-            for idx, t in enumerate(to_download):
-                process_item(idx, t)
+            for idx, (orig_idx, t) in enumerate(to_download):
+                process_item(idx, orig_idx, t)
+
+    all_synced = [t for t in raw_tracks if t.get("status") in ("reused", "downloaded")]
+    if total > 0 and len(all_synced) == 0:
+        task_state["status"] = "failed"
+        task_state["end_time"] = datetime.now().isoformat()
+        task_state["current_track"] = None
+        push_monitor_update(task_state)
+        print(f"❌ Playlist 《{playlist_name}》 sync failed: 0/{total} tracks available (all downloads failed).", file=sys.stderr)
+        sys.exit(1)
 
     # Finalize M3U8 & fnOS Database
     task_state["status"] = "finalizing"
@@ -920,8 +1084,7 @@ def main():
     }
     push_monitor_update(task_state)
 
-    all_synced = [t for t in raw_tracks if t.get("status") in ("reused", "downloaded")]
-    m3u_path = generate_m3u8(playlist_name, all_synced)
+    m3u_path = generate_m3u8(playlist_name, all_synced, target_mode=args.target, target_user=args.user)
     print(f"✅ Generated M3U8 playlist: {m3u_path}")
 
     cover_guid = import_playlist_cover(cover_url)

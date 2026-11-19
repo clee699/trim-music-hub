@@ -1,18 +1,22 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
 import type { PlaylistSummary, CurrentUser } from '../../types';
-import { api } from '../../api';
+import { api, resolveApiUrl } from '../../api';
+import { showToast } from '../../composables/useToast';
 
 const props = defineProps<{ currentUser?: CurrentUser | null }>();
-import { showToast } from '../../composables/useToast';
+const emit = defineEmits<{
+  (e: 'selection-change', val: boolean): void;
+}>();
+
 import PlaylistTracksModal from '../modals/PlaylistTracksModal.vue';
 import BatchActionBar from '@/components/ui/BatchActionBar.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
-import { Popconfirm } from '@/components/ui/popconfirm';
 import { Card } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
+import { SpringTabs, type SpringTabItem } from '@/components/ui/tabs';
 import { EmptyState, LoadingState, ErrorState } from '@/components/ui/state';
 import { ListSentinel, PullRefreshList } from '@/components/ui/list';
 import {
@@ -25,19 +29,15 @@ import {
 } from '@/components/ui/dialog';
 import {
   ListMusic,
-  Disc3,
   UserCheck,
   RefreshCw,
   Loader2,
-  Trash2,
   Edit3,
   Music,
   CalendarDays,
   Search,
   Globe,
-  Check,
   X,
-  Clock
 } from 'lucide-vue-next';
 
 const playlists = ref<PlaylistSummary[]>([]);
@@ -47,10 +47,18 @@ const loadError = ref('');
 const searchKw = ref('');
 const failedCoverKeys = ref<Set<string>>(new Set());
 
-// 批量选择与操作状态（对齐曲库多选交互）
-const selectedPlaylistNames = ref<Set<string>>(new Set());
+function playlistKey(pl: PlaylistSummary): string {
+  return pl.id != null ? `id:${pl.id}` : `name:${pl.name}`;
+}
+
+// 批量选择与操作状态（使用唯一 key 隔离同名个人歌单）
+const selectedPlaylistKeys = ref<Set<string>>(new Set());
 const isBatchDeletingPlaylists = ref(false);
 const batchDeletePhysical = ref(false);
+
+watch(() => selectedPlaylistKeys.value.size > 0, (val) => {
+  emit('selection-change', val);
+});
 
 // 滚动分页控制
 const displayLimit = ref(15);
@@ -60,7 +68,9 @@ const filteredPlaylists = computed(() => {
   if (!kw) return playlists.value;
   return playlists.value.filter(p => {
     const nameMatch = p.name.toLowerCase().includes(kw);
-    const userStr = typeof p.users === 'string' ? p.users : '';
+    const userStr = Array.isArray(p.users)
+      ? p.users.map(u => u.name).join(',')
+      : (typeof p.users === 'string' ? p.users : '');
     const userMatch = userStr.toLowerCase().includes(kw);
     return nameMatch || userMatch;
   });
@@ -87,23 +97,50 @@ const tracksDialogOpen = ref(false);
 const activePlaylistName = ref('');
 const activePlaylist = ref<PlaylistSummary | null>(null);
 
-function handleModalTracksChanged(event: { playlistName: string; remainingCount: number }) {
-  const pl = playlists.value.find(p => p.name === event.playlistName);
+function handleModalTracksChanged(event: { playlistId?: number; playlistName: string; remainingCount: number }) {
+  const pl = playlists.value.find(p =>
+    event.playlistId != null ? p.id === event.playlistId : p.name === event.playlistName
+  );
   if (pl) {
     pl.track_count = event.remainingCount;
   }
-  if (activePlaylist.value && activePlaylist.value.name === event.playlistName) {
+  if (
+    activePlaylist.value &&
+    (event.playlistId != null
+      ? activePlaylist.value.id === event.playlistId
+      : activePlaylist.value.name === event.playlistName)
+  ) {
     activePlaylist.value.track_count = event.remainingCount;
   }
 }
 
 // Edit Playlist Dialog (Name + User Assignment)
 const editDialogOpen = ref(false);
+const editingPlaylist = ref<PlaylistSummary | null>(null);
 const editOldName = ref('');
 const editNewName = ref('');
-const editIsPublic = ref(true);
+const editVisibilityMode = ref<'public' | 'custom'>('public');
 const editSelectedUserIds = ref<number[]>([]);
 const isSavingEdit = ref(false);
+
+const visibilityTabs: SpringTabItem<'public' | 'custom'>[] = [
+  { value: 'public', label: '公共歌单', icon: Globe },
+  { value: 'custom', label: '指定成员', icon: UserCheck },
+];
+
+watch(editVisibilityMode, (mode) => {
+  if (mode === 'public') {
+    editSelectedUserIds.value = systemUsers.value.map(u => u.id);
+  } else if (
+    editSelectedUserIds.value.length === systemUsers.value.length &&
+    systemUsers.value.length > 1
+  ) {
+    const defaultUid = props.currentUser?.userId || systemUsers.value[0]?.id;
+    editSelectedUserIds.value = defaultUid ? [defaultUid] : [];
+  } else if (editSelectedUserIds.value.length === 0 && systemUsers.value.length > 0) {
+    editSelectedUserIds.value = [systemUsers.value[0].id];
+  }
+});
 
 async function fetchUsers() {
   try {
@@ -134,9 +171,9 @@ async function fetchPlaylists(silent = false) {
     const res = await api.getPlaylists();
     if (res.ok) {
       playlists.value = res.data || [];
-      const currentNames = new Set(playlists.value.map(p => p.name));
-      selectedPlaylistNames.value = new Set(
-        Array.from(selectedPlaylistNames.value).filter(name => currentNames.has(name))
+      const currentKeys = new Set(playlists.value.map(p => playlistKey(p)));
+      selectedPlaylistKeys.value = new Set(
+        Array.from(selectedPlaylistKeys.value).filter(key => currentKeys.has(key))
       );
       loadError.value = '';
     } else {
@@ -151,61 +188,6 @@ async function fetchPlaylists(silent = false) {
   }
 }
 
-function canManagePlaylist(pl: PlaylistSummary): boolean {
-  if (!props.currentUser) return false;
-  if (props.currentUser.isAdmin) return true;
-  return Array.isArray(pl.user_ids) && pl.user_ids.includes(props.currentUser.userId);
-}
-
-function toggleSelectPlaylist(pl: PlaylistSummary) {
-  if (!canManagePlaylist(pl)) {
-    showToast('普通用户仅可选择和管理属于自己的个人歌单', 'warning');
-    return;
-  }
-  const name = pl.name;
-  const next = new Set(selectedPlaylistNames.value);
-  if (next.has(name)) {
-    next.delete(name);
-  } else {
-    next.add(name);
-  }
-  selectedPlaylistNames.value = next;
-}
-
-function toggleSelectAllPlaylists() {
-  const manageable = filteredPlaylists.value.filter(p => canManagePlaylist(p));
-  if (manageable.length === 0) {
-    showToast('当前没有可供管理的个人歌单', 'info');
-    return;
-  }
-  if (selectedPlaylistNames.value.size === manageable.length) {
-    selectedPlaylistNames.value = new Set();
-  } else {
-    selectedPlaylistNames.value = new Set(manageable.map(p => p.name));
-  }
-}
-
-async function handleBatchDeletePlaylists() {
-  const targetNames = Array.from(selectedPlaylistNames.value);
-  if (targetNames.length === 0) return;
-
-  isBatchDeletingPlaylists.value = true;
-  try {
-    const results = await Promise.all(
-      targetNames.map(name => api.deletePlaylist(name, batchDeletePhysical.value))
-    );
-    const successCount = results.filter(r => r.ok).length;
-    const targetSet = new Set(targetNames);
-    playlists.value = playlists.value.filter(p => !targetSet.has(p.name));
-    selectedPlaylistNames.value = new Set();
-    showToast(`已删除 ${successCount} 个歌单${batchDeletePhysical.value ? '，并清理本地文件' : ''}。`, 'success');
-  } catch (e: any) {
-    showToast(`批量删除歌单失败: ${e.message}`, 'error');
-  } finally {
-    isBatchDeletingPlaylists.value = false;
-  }
-}
-
 function getPlaylistMembers(users: PlaylistSummary['users']) {
   if (Array.isArray(users)) {
     return users.map(user => user.name).filter(Boolean);
@@ -214,6 +196,7 @@ function getPlaylistMembers(users: PlaylistSummary['users']) {
 }
 
 function isPublicPlaylist(pl: PlaylistSummary): boolean {
+  if (typeof pl.is_public === 'boolean') return pl.is_public;
   if (systemUsers.value.length > 0 && pl.user_ids && pl.user_ids.length > 0) {
     const allUids = systemUsers.value.map(u => u.id);
     if (allUids.every(uid => pl.user_ids?.includes(uid))) {
@@ -222,6 +205,85 @@ function isPublicPlaylist(pl: PlaylistSummary): boolean {
   }
   const members = getPlaylistMembers(pl.users);
   return members.length === 0 || members.some(m => /公共|所有成员/.test(m));
+}
+
+function canManagePlaylist(pl: PlaylistSummary): boolean {
+  if (!props.currentUser) return false;
+  if (props.currentUser.isAdmin) return true;
+  if (typeof pl.can_manage === 'boolean') return pl.can_manage;
+  return !isPublicPlaylist(pl) && Array.isArray(pl.user_ids) && pl.user_ids.includes(props.currentUser.userId);
+}
+
+const manageablePlaylists = computed(() =>
+  filteredPlaylists.value.filter(p => canManagePlaylist(p))
+);
+
+const isAllPlaylistsSelected = computed(() =>
+  manageablePlaylists.value.length > 0 &&
+  manageablePlaylists.value.every(p => selectedPlaylistKeys.value.has(playlistKey(p)))
+);
+
+function toggleSelectPlaylist(pl: PlaylistSummary) {
+  if (!canManagePlaylist(pl)) {
+    showToast('无权管理该公共歌单', 'warning');
+    return;
+  }
+  const key = playlistKey(pl);
+  const next = new Set(selectedPlaylistKeys.value);
+  if (next.has(key)) {
+    next.delete(key);
+  } else {
+    next.add(key);
+  }
+  selectedPlaylistKeys.value = next;
+}
+
+function toggleSelectAllPlaylists() {
+  const manageable = manageablePlaylists.value;
+  if (manageable.length === 0) return;
+  const next = new Set(selectedPlaylistKeys.value);
+  if (isAllPlaylistsSelected.value) {
+    for (const p of manageable) next.delete(playlistKey(p));
+  } else {
+    for (const p of manageable) next.add(playlistKey(p));
+  }
+  selectedPlaylistKeys.value = next;
+}
+
+async function handleBatchDeletePlaylists() {
+  const targets = playlists.value.filter(p => selectedPlaylistKeys.value.has(playlistKey(p)));
+  if (targets.length === 0) return;
+
+  const deletePhysical = Boolean(props.currentUser?.isAdmin && batchDeletePhysical.value);
+  isBatchDeletingPlaylists.value = true;
+  try {
+    const results = await Promise.all(
+      targets.map(pl => api.deletePlaylist(pl.name, deletePhysical, pl.id, pl.playlist_ids))
+    );
+    const succeededKeys = new Set(
+      targets.filter((_, idx) => results[idx]?.ok).map(pl => playlistKey(pl))
+    );
+    const failedCount = targets.length - succeededKeys.size;
+    if (succeededKeys.size > 0) {
+      playlists.value = playlists.value.filter(p => !succeededKeys.has(playlistKey(p)));
+      selectedPlaylistKeys.value = new Set(
+        Array.from(selectedPlaylistKeys.value).filter(k => !succeededKeys.has(k))
+      );
+    }
+    if (failedCount === 0) {
+      batchDeletePhysical.value = false;
+      showToast(`已删除 ${succeededKeys.size} 个歌单${deletePhysical ? '，并清理本地文件' : ''}。`, 'success');
+    } else if (succeededKeys.size > 0) {
+      showToast(`已删除 ${succeededKeys.size} 个歌单，${failedCount} 个失败。`, 'warning');
+    } else {
+      const firstErr = results.find(r => !r.ok)?.error || '删除歌单失败';
+      showToast(firstErr, 'error');
+    }
+  } catch (e: any) {
+    showToast(`批量删除歌单失败: ${e.message}`, 'error');
+  } finally {
+    isBatchDeletingPlaylists.value = false;
+  }
 }
 
 function formatMemberSummary(pl: PlaylistSummary) {
@@ -242,7 +304,7 @@ function formatPlaylistDate(value?: string) {
 type CoverType = 'playlist' | 'track';
 
 function coverUrl(type: CoverType, guid?: string) {
-  return guid ? `/api/covers/${type}/${encodeURIComponent(guid)}?size=160` : '';
+  return guid ? resolveApiUrl(`/api/covers/${type}/${encodeURIComponent(guid)}?size=160`) : '';
 }
 
 function coverAvailable(type: CoverType, guid?: string) {
@@ -256,39 +318,31 @@ function markCoverFailed(type: CoverType, guid?: string) {
 }
 
 function viewTracks(pl: PlaylistSummary) {
-  if (selectedPlaylistNames.value.size > 0) return;
+  if (selectedPlaylistKeys.value.size > 0) return;
   activePlaylist.value = pl;
   activePlaylistName.value = pl.name;
   tracksDialogOpen.value = true;
 }
 
 function openEdit(pl: PlaylistSummary) {
-  if (selectedPlaylistNames.value.size > 0) return;
+  if (selectedPlaylistKeys.value.size > 0) return;
+  editingPlaylist.value = pl;
   editOldName.value = pl.name;
   editNewName.value = pl.name;
 
   const allUids = systemUsers.value.map(u => u.id);
   const currentUids = pl.user_ids || [];
 
-  const isPublic = isPublicPlaylist(pl);
-  editIsPublic.value = isPublic;
-
-  if (isPublic) {
+  const isPub = isPublicPlaylist(pl);
+  if (isPub) {
     editSelectedUserIds.value = [...allUids];
+    editVisibilityMode.value = 'public';
   } else {
     editSelectedUserIds.value = currentUids.length > 0 ? [...currentUids] : (allUids[0] ? [allUids[0]] : []);
+    editVisibilityMode.value = 'custom';
   }
 
   editDialogOpen.value = true;
-}
-
-function toggleEditPublic(isPub: boolean) {
-  editIsPublic.value = isPub;
-  if (isPub) {
-    editSelectedUserIds.value = systemUsers.value.map(u => u.id);
-  } else if (editSelectedUserIds.value.length === 0 && systemUsers.value.length > 0) {
-    editSelectedUserIds.value = [systemUsers.value[0].id];
-  }
 }
 
 function toggleEditUserId(uid: number) {
@@ -300,9 +354,9 @@ function toggleEditUserId(uid: number) {
   }
   editSelectedUserIds.value = Array.from(s);
   if (systemUsers.value.length > 0 && editSelectedUserIds.value.length === systemUsers.value.length) {
-    editIsPublic.value = true;
+    editVisibilityMode.value = 'public';
   } else {
-    editIsPublic.value = false;
+    editVisibilityMode.value = 'custom';
   }
 }
 
@@ -313,11 +367,13 @@ async function handleSaveEdit() {
     return;
   }
 
-  const targetUids = editIsPublic.value
+  const pl = editingPlaylist.value;
+  const isAdmin = Boolean(props.currentUser?.isAdmin);
+  const targetUids = editVisibilityMode.value === 'public'
     ? systemUsers.value.map(u => u.id)
     : editSelectedUserIds.value;
 
-  if (targetUids.length === 0) {
+  if (isAdmin && targetUids.length === 0) {
     showToast('请至少选择一个可见成员', 'warning');
     return;
   }
@@ -326,7 +382,7 @@ async function handleSaveEdit() {
   try {
     let effectiveName = editOldName.value;
     if (newName !== editOldName.value) {
-      const resRename = await api.renamePlaylist(editOldName.value, newName);
+      const resRename = await api.renamePlaylist(editOldName.value, newName, pl?.id, pl?.playlist_ids);
       if (!resRename.ok) {
         showToast(resRename.error || '重命名失败', 'error');
         return;
@@ -334,10 +390,12 @@ async function handleSaveEdit() {
       effectiveName = newName;
     }
 
-    const resUsers = await api.updatePlaylistUsers(effectiveName, targetUids);
-    if (!resUsers.ok) {
-      showToast(resUsers.error || '更新歌单可见成员失败', 'error');
-      return;
+    if (isAdmin) {
+      const resUsers = await api.updatePlaylistUsers(effectiveName, targetUids, pl?.id, pl?.playlist_ids);
+      if (!resUsers.ok) {
+        showToast(resUsers.error || '更新歌单可见成员失败', 'error');
+        return;
+      }
     }
 
     showToast(`“${effectiveName}”已保存。`, 'success');
@@ -382,21 +440,23 @@ onMounted(async () => {
             placeholder="搜索歌单或成员"
             class="pl-9 pr-8 h-9 text-xs"
           />
-          <button
+          <Button
             v-if="searchKw"
             type="button"
+            variant="ghost"
+            size="iconSm"
             @click="searchKw = ''"
-            class="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground p-0.5 rounded-full"
+            class="absolute right-1.5 top-1/2 -translate-y-1/2 h-6 w-6 text-muted-foreground hover:text-foreground rounded-full"
             title="清空"
           >
             <X class="w-3.5 h-3.5" />
-          </button>
+          </Button>
         </div>
 
         <Button
           variant="outline"
           size="icon"
-          @click="fetchPlaylists"
+          @click="fetchPlaylists()"
           title="刷新歌单列表"
           class="h-9 w-9 rounded-xl shrink-0"
         >
@@ -408,20 +468,22 @@ onMounted(async () => {
     <!-- 固定的列表头部栏（全选 / 统计，固定于列表上方不随列表滚动） -->
     <div v-if="filteredPlaylists.length > 0" class="flex items-center justify-between px-1 text-xs shrink-0">
       <div class="flex items-center gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          class="h-7 px-2 text-muted-foreground text-[11px] sm:text-xs"
-          @click="toggleSelectAllPlaylists"
-        >
-          {{ selectedPlaylistNames.size === filteredPlaylists.length && filteredPlaylists.length > 0 ? '取消全选' : '全选' }}
-        </Button>
-        <span class="text-muted-foreground/50">|</span>
+        <template v-if="manageablePlaylists.length > 0">
+          <Button
+            variant="ghost"
+            size="sm"
+            class="h-7 px-2 text-muted-foreground text-[11px] sm:text-xs"
+            @click="toggleSelectAllPlaylists"
+          >
+            {{ isAllPlaylistsSelected ? '取消全选' : '全选' }}
+          </Button>
+          <span class="text-muted-foreground/50">|</span>
+        </template>
         <span class="text-muted-foreground text-[11px] sm:text-xs">
           共 <strong class="text-foreground font-mono">{{ filteredPlaylists.length }}</strong> 个歌单
         </span>
-        <span v-if="selectedPlaylistNames.size > 0" class="text-warning font-medium text-[11px] sm:text-xs">
-          · 已选 {{ selectedPlaylistNames.size }} 个
+        <span v-if="selectedPlaylistKeys.size > 0" class="text-warning font-medium text-[11px] sm:text-xs">
+          · 已选 {{ selectedPlaylistKeys.size }} 个
         </span>
       </div>
     </div>
@@ -444,7 +506,7 @@ onMounted(async () => {
         title="歌单列表获取失败"
         :description="loadError"
         retry-text="重新加载"
-        @retry="fetchPlaylists"
+        @retry="fetchPlaylists()"
       />
 
       <EmptyState
@@ -469,18 +531,18 @@ onMounted(async () => {
       >
         <article
           v-for="pl in displayedPlaylists"
-          :key="pl.name"
+          :key="playlistKey(pl)"
           :class="[
             'media-list-row media-list-row--playlist transition-all',
-            { 'media-list-row--selected': selectedPlaylistNames.has(pl.name) }
+            { 'media-list-row--selected': selectedPlaylistKeys.has(playlistKey(pl)) }
           ]"
-          role="button"
-          tabindex="0"
-          :aria-pressed="selectedPlaylistNames.has(pl.name)"
-          :aria-label="`${selectedPlaylistNames.has(pl.name) ? '取消选择' : '选择'}歌单 ${pl.name}`"
-          @click="toggleSelectPlaylist(pl)"
-          @keydown.enter.prevent="toggleSelectPlaylist(pl)"
-          @keydown.space.prevent="toggleSelectPlaylist(pl)"
+          :role="canManagePlaylist(pl) ? 'button' : undefined"
+          :tabindex="canManagePlaylist(pl) ? 0 : undefined"
+          :aria-pressed="canManagePlaylist(pl) ? selectedPlaylistKeys.has(playlistKey(pl)) : undefined"
+          :aria-label="canManagePlaylist(pl) ? `${selectedPlaylistKeys.has(playlistKey(pl)) ? '取消选择' : '选择'}歌单 ${pl.name}` : undefined"
+          @click="canManagePlaylist(pl) ? toggleSelectPlaylist(pl) : viewTracks(pl)"
+          @keydown.enter.prevent="canManagePlaylist(pl) ? toggleSelectPlaylist(pl) : viewTracks(pl)"
+          @keydown.space.prevent="canManagePlaylist(pl) ? toggleSelectPlaylist(pl) : viewTracks(pl)"
         >
           <div class="media-list-row__art" aria-hidden="true">
             <img
@@ -515,17 +577,17 @@ onMounted(async () => {
 
           <!-- 末尾操作工具栏：未处于多选时显示详情与编辑；进入多选时切换为勾选状态，杜绝交互冲突 -->
           <div
-            v-if="selectedPlaylistNames.size > 0"
+            v-if="selectedPlaylistKeys.size > 0 && canManagePlaylist(pl)"
             class="media-list-row__playlist-tools pointer-events-none pr-1"
           >
             <Checkbox
-              :checked="selectedPlaylistNames.has(pl.name)"
+              :checked="selectedPlaylistKeys.has(playlistKey(pl))"
               tabindex="-1"
               class="pointer-events-none"
             />
           </div>
           <div
-            v-else
+            v-else-if="selectedPlaylistKeys.size === 0"
             class="media-list-row__playlist-tools"
             @click.stop
           >
@@ -565,22 +627,21 @@ onMounted(async () => {
     </PullRefreshList>
 
     <!-- 底部浮动批量操作栏（歌单管理） -->
-    <!-- 批量操作悬浮条 (通用组件复用) -->
     <BatchActionBar
-      :show="selectedPlaylistNames.size > 0"
-      :count="selectedPlaylistNames.size"
+      :show="selectedPlaylistKeys.size > 0"
+      :count="selectedPlaylistKeys.size"
       unit="个歌单"
       action-text="彻底删除"
       confirm-title="彻底删除选中的歌单？"
       confirm-desc="歌单将从飞牛音乐中移除。"
       :loading="isBatchDeletingPlaylists"
-      @cancel="selectedPlaylistNames = new Set()"
+      @cancel="selectedPlaylistKeys = new Set()"
       @confirm="handleBatchDeletePlaylists"
     >
       <template #extra>
         <label v-if="currentUser?.isAdmin" class="mt-2 flex cursor-pointer select-none items-center gap-2.5 rounded-xl border border-destructive/25 bg-destructive/10 p-2 text-[11px] text-destructive">
           <Checkbox v-model="batchDeletePhysical" />
-          <span>同时删除歌单中的本地歌曲和歌词 (管理员权限)</span>
+          <span>同时删除歌单中的本地歌曲和歌词</span>
         </label>
       </template>
     </BatchActionBar>
@@ -590,6 +651,7 @@ onMounted(async () => {
       v-model:open="tracksDialogOpen"
       :playlist-name="activePlaylistName"
       :playlist-summary="activePlaylist"
+      :current-user="currentUser"
       @tracks-changed="handleModalTracksChanged"
     />
 
@@ -602,7 +664,7 @@ onMounted(async () => {
             <span>编辑歌单</span>
           </DialogTitle>
           <DialogDescription class="text-xs text-muted-foreground">
-            修改歌单名称和可见成员。
+            {{ currentUser?.isAdmin ? '修改歌单名称和可见成员。' : '修改歌单名称。' }}
           </DialogDescription>
         </DialogHeader>
 
@@ -617,72 +679,35 @@ onMounted(async () => {
             />
           </div>
 
-          <!-- 可见范围设置 (仅管理员可见) -->
-          <div v-if="currentUser?.isAdmin" class="space-y-2">
-            <label class="text-xs font-medium text-foreground">可见成员</label>
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                @click="toggleEditPublic(true)"
-                :class="[
-                  'flex items-center gap-2 p-2.5 rounded-xl border text-xs font-medium text-left transition-all',
-                  editIsPublic
-                    ? 'border-primary/60 bg-primary/10 text-primary'
-                    : 'border-border bg-card/60 text-muted-foreground hover:bg-muted'
-                ]"
-              >
-                <Globe class="w-4 h-4 shrink-0" />
-                <div>
-                  <div class="font-semibold text-foreground">公共歌单</div>
-                  <div class="text-[10px] text-muted-foreground">所有家庭成员均可见</div>
-                </div>
-              </button>
-
-              <button
-                type="button"
-                @click="toggleEditPublic(false)"
-                :class="[
-                  'flex items-center gap-2 p-2.5 rounded-xl border text-xs font-medium text-left transition-all',
-                  !editIsPublic
-                    ? 'border-primary/60 bg-primary/10 text-primary'
-                    : 'border-border bg-card/60 text-muted-foreground hover:bg-muted'
-                ]"
-              >
-                <UserCheck class="w-4 h-4 shrink-0" />
-                <div>
-                  <div class="font-semibold text-foreground">指定成员</div>
-                  <div class="text-[10px] text-muted-foreground">仅勾选的成员可见</div>
-                </div>
-              </button>
-            </div>
+          <!-- 可见范围设置 (仅管理员可见，使用物理惯性弹簧切换器) -->
+          <div v-if="currentUser?.isAdmin" class="space-y-2.5">
+            <label class="text-xs font-medium text-foreground">可见范围</label>
+            <SpringTabs
+              v-model="editVisibilityMode"
+              :items="visibilityTabs"
+              full-width
+            />
 
             <!-- 成员勾选列表 -->
             <div
-              v-if="!editIsPublic && systemUsers.length > 0"
-              class="space-y-1 pt-1.5 max-h-40 overflow-y-auto"
+              v-if="editVisibilityMode === 'custom' && systemUsers.length > 0"
+              class="space-y-1 pt-1.5 max-h-40 overflow-y-auto custom-scrollbar pr-1"
             >
-              <div
+              <label
                 v-for="u in systemUsers"
                 :key="u.id"
-                @click="toggleEditUserId(u.id)"
-                class="flex items-center justify-between p-2 rounded-lg hover:bg-muted/60 cursor-pointer text-xs"
+                class="flex items-center justify-between p-2 rounded-lg hover:bg-muted/60 cursor-pointer text-xs select-none"
               >
                 <div class="flex items-center gap-2">
                   <UserCheck class="w-3.5 h-3.5 text-muted-foreground" />
                   <span>{{ u.name }}</span>
                   <Badge v-if="u.role === 'admin'" variant="secondary" class="text-[9px] px-1 py-0">管理员</Badge>
                 </div>
-                <div
-                  :class="[
-                    'w-4 h-4 rounded border flex items-center justify-center transition-colors',
-                    editSelectedUserIds.includes(u.id)
-                      ? 'bg-primary border-primary text-primary-foreground'
-                      : 'border-border'
-                  ]"
-                >
-                  <Check v-if="editSelectedUserIds.includes(u.id)" class="w-3 h-3 stroke-[3]" />
-                </div>
-              </div>
+                <Checkbox
+                  :checked="editSelectedUserIds.includes(u.id)"
+                  @update:checked="toggleEditUserId(u.id)"
+                />
+              </label>
             </div>
           </div>
         </div>

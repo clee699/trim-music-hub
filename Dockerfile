@@ -3,8 +3,8 @@
 FROM node:24-bookworm-slim AS frontend-builder
 WORKDIR /app/frontend
 
-COPY frontend/package.json ./
-RUN npm config set registry https://registry.npmmirror.com && npm install
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm config set registry https://registry.npmmirror.com && npm ci
 
 COPY frontend/ ./
 RUN npm run build
@@ -16,18 +16,20 @@ LABEL maintainer="TRIM Music Hub"
 LABEL description="fnOS (飞牛 NAS) 音乐导入、单曲搜索下载与曲库管理中枢 (Vue 3 + Node.js 24 + Python 3)"
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
     NODE_ENV=production \
     PORT=4175 \
     HOST=0.0.0.0 \
     MUSIC_DIR=/media/music \
     FNOS_DB_PATH=/app/db/music.db \
+    FNOS_COVER_DIR=/app/cover \
     DATA_DIR=/app/data \
     PUID=1000 \
     PGID=1000 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# Install required system tools (Python3, FLAC/metaflac, FFmpeg, curl)
+# Install required system tools (Python3, FLAC/metaflac, FFmpeg, curl, tzdata)
 RUN (sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true) && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -35,21 +37,21 @@ RUN (sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/deb
     ffmpeg \
     curl \
     ca-certificates \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Create necessary mount points
-RUN mkdir -p /media/music /app/db /app/data
+RUN mkdir -p /media/music /app/db /app/cover /app/data
 
-# Copy backend dependencies & install
+# Copy backend dependencies & install deterministically
 COPY package.json package-lock.json ./
-RUN npm config set registry https://registry.npmmirror.com && npm install --omit=dev
+RUN npm config set registry https://registry.npmmirror.com && npm ci --omit=dev
 
 # Copy backend files
 COPY server.mjs db_ops.py ./
 COPY scripts/ ./scripts/
-COPY public/ ./public/
 
 # Copy built modern frontend from builder stage
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist

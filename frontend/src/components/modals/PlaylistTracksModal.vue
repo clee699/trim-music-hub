@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
-import type { PlaylistSummary, PlaylistTrack, HistoryItem } from '../../types';
-import { api } from '../../api';
+import type { PlaylistSummary, PlaylistTrack, HistoryItem, CurrentUser } from '../../types';
+import { api, resolveApiUrl } from '../../api';
 import { showToast } from '../../composables/useToast';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Popconfirm } from '@/components/ui/popconfirm';
 import BatchActionBar from '@/components/ui/BatchActionBar.vue';
 import {
   Dialog,
@@ -21,7 +20,6 @@ import {
   Disc3,
   RefreshCw,
   Loader2,
-  Trash2,
   Search,
   X,
   Clock,
@@ -33,18 +31,20 @@ interface Props {
   playlistName: string;
   playlistSummary?: PlaylistSummary | null;
   historyItem?: HistoryItem | null;
+  currentUser?: CurrentUser | null;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   open: false,
   playlistName: '',
   playlistSummary: null,
-  historyItem: null
+  historyItem: null,
+  currentUser: null,
 });
 
 const emit = defineEmits<{
   (e: 'update:open', val: boolean): void;
-  (e: 'tracks-changed', payload: { playlistName: string; remainingCount: number }): void;
+  (e: 'tracks-changed', payload: { playlistId?: number; playlistName: string; remainingCount: number }): void;
 }>();
 
 const playlistTracks = ref<PlaylistTrack[]>([]);
@@ -55,15 +55,39 @@ const selectedTrackIds = ref<Set<number>>(new Set());
 
 const matchedSummary = ref<PlaylistSummary | null>(null);
 const failedCoverKeys = ref<Set<string>>(new Set());
+let loadSeq = 0;
 
-// 单曲与批量移出状态
-const removingTrackId = ref<number | null>(null);
-const removeTrackPhysicalMap = ref<Record<number, boolean>>({});
+// 批量移出状态
 const isBatchRemoving = ref(false);
 const batchRemovePhysical = ref(false);
 
 const currentSummary = computed(() => {
   return props.playlistSummary || matchedSummary.value;
+});
+
+const canManage = computed(() => {
+  if (!props.currentUser) return false;
+  if (props.currentUser.isAdmin) return true;
+  const sum = currentSummary.value;
+  if (sum) {
+    if (typeof sum.can_manage === 'boolean') return sum.can_manage;
+    if (sum.is_public) return false;
+    return Array.isArray(sum.user_ids) && sum.user_ids.includes(props.currentUser.userId);
+  }
+  if (props.historyItem) {
+    if (props.historyItem.target === 'public') return false;
+    return (
+      props.historyItem.owner_user === props.currentUser.username ||
+      props.historyItem.user === props.currentUser.username
+    );
+  }
+  return false;
+});
+
+watch(canManage, (allowed) => {
+  if (!allowed && selectedTrackIds.value.size > 0) {
+    selectedTrackIds.value = new Set();
+  }
 });
 
 const playlistTotalSize = computed(() => {
@@ -101,22 +125,18 @@ const filteredPlaylistTracks = computed(() => {
 const filterReusedOnly = ref(false);
 
 function isTrackReused(t: PlaylistTrack): boolean {
-  // 必须是在历史记录上下文查看时才标记复用；普通歌单管理不显示复用标签
   if (!props.historyItem) {
     return false;
   }
 
-  // 1. 如果该历史记录明确记录了复用曲目为 0，则该歌单在下载时根本没有复用歌曲，绝对返回 false
   if (typeof props.historyItem.reused_count === 'number' && props.historyItem.reused_count === 0) {
     return false;
   }
 
-  // 2. 如果曲目自身已经有显式 is_reused 标识
   if (typeof t.is_reused === 'boolean') {
     return t.is_reused;
   }
 
-  // 3. 严格以当时下载任务记录中每首曲目的 status 为准
   if (props.historyItem.tracks && Array.isArray(props.historyItem.tracks) && props.historyItem.tracks.length > 0) {
     const normTitle = (t.title || '').trim().toLowerCase();
     const normArtist = (t.artist || '').trim().toLowerCase();
@@ -130,19 +150,14 @@ function isTrackReused(t: PlaylistTrack): boolean {
       );
     });
     if (match) {
-      // 只有在当时任务中被判定为 reused（本地已存在跳过下载）的才标记为复用
-      // 若当时执行了下载（downloaded），绝不是复用
       return match.status === 'reused';
     }
   }
 
-  // 4. 兜底逻辑（针对未保存 tracks 数组的早期历史记录）：
-  // 仅当历史记录明确有 reused_count > 0 时才可能触发
   if (props.historyItem.reused_count && props.historyItem.reused_count > 0) {
     if (t.created_at && props.historyItem.start_time) {
       const trackCreatedTime = new Date(t.created_at).getTime();
       const taskStartTime = new Date(props.historyItem.start_time).getTime();
-      // 曲库建档时间必须在任务开始之前（至少早于开始前 10 秒），代表在本次任务开始前就已经存在于本地曲库
       if (!isNaN(trackCreatedTime) && !isNaN(taskStartTime)) {
         if (trackCreatedTime < taskStartTime - 10000) {
           return true;
@@ -181,6 +196,7 @@ const reusedCount = computed(() => {
 });
 
 function toggleSelectTrack(id: number) {
+  if (!canManage.value) return;
   const s = new Set(selectedTrackIds.value);
   if (s.has(id)) {
     s.delete(id);
@@ -191,6 +207,7 @@ function toggleSelectTrack(id: number) {
 }
 
 function toggleSelectAllTracks() {
+  if (!canManage.value) return;
   const visible = filteredPlaylistTracks.value;
   if (visible.length === 0) return;
   const allSelected = visible.every(t => selectedTrackIds.value.has(t.id));
@@ -249,25 +266,54 @@ function formatHistoryDate(iso?: string) {
 type CoverType = 'playlist' | 'track';
 
 function coverUrl(type: CoverType, guid?: string) {
-  return guid ? `/api/covers/${type}/${encodeURIComponent(guid)}?size=160` : '';
+  return guid ? resolveApiUrl(`/api/covers/${type}/${encodeURIComponent(guid)}?size=160`) : '';
 }
 
 function coverAvailable(type: CoverType, guid?: string) {
   return Boolean(guid) && !failedCoverKeys.value.has(`${type}:${guid}`);
 }
 
-function markCoverFailed(type: CoverType, guid?: string) {
+function markCoverFailed(type: CoverType | 'history', key?: string | number) {
   const next = new Set(failedCoverKeys.value);
-  next.add(`${type}:${guid || ''}`);
+  next.add(`${type}:${key ?? ''}`);
   failedCoverKeys.value = next;
 }
 
-async function fetchPlaylistTracks(name: string) {
+async function fetchMatchedSummary(name: string): Promise<PlaylistSummary | null> {
+  if (props.playlistSummary) return props.playlistSummary;
+  if (!name) return null;
+  try {
+    const res = await api.getPlaylists();
+    if (res.ok && Array.isArray(res.data)) {
+      const candidates = res.data.filter(p => p.name === name);
+      if (candidates.length === 0) return null;
+      if (props.historyItem && candidates.length > 1) {
+        const wantPublic = props.historyItem.target === 'public';
+        const exact = candidates.find(p => Boolean(p.is_public) === wantPublic);
+        if (exact) {
+          matchedSummary.value = exact;
+          return exact;
+        }
+      }
+      matchedSummary.value = candidates[0];
+      return candidates[0];
+    }
+  } catch (e) {
+    // 静默处理
+  }
+  return null;
+}
+
+async function loadModalData(name: string) {
   if (!name) return;
+  const seq = ++loadSeq;
   loadingTracks.value = true;
   loadTracksError.value = '';
   try {
-    const res = await api.getPlaylistTracks(name);
+    const summary = props.playlistSummary || (await fetchMatchedSummary(name));
+    if (seq !== loadSeq) return;
+    const res = await api.getPlaylistTracks(name, summary?.id, summary?.playlist_ids);
+    if (seq !== loadSeq) return;
     if (res.ok) {
       playlistTracks.value = res.data || [];
     } else {
@@ -275,65 +321,35 @@ async function fetchPlaylistTracks(name: string) {
       showToast('无法读取歌单歌曲，请稍后重试。', 'error');
     }
   } catch (e: any) {
-    loadTracksError.value = e.message || '读取歌曲失败';
-    showToast(`读取歌曲失败：${e.message}`, 'error');
-  } finally {
-    loadingTracks.value = false;
-  }
-}
-
-async function fetchMatchedSummary(name: string) {
-  if (props.playlistSummary || !name) return;
-  try {
-    const res = await api.getPlaylists();
-    if (res.ok && Array.isArray(res.data)) {
-      const found = res.data.find(p => p.name === name);
-      if (found) {
-        matchedSummary.value = found;
-      }
+    if (seq === loadSeq) {
+      loadTracksError.value = e.message || '读取歌曲失败';
+      showToast(`读取歌曲失败：${e.message}`, 'error');
     }
-  } catch (e) {
-    // 静默处理
-  }
-}
-
-async function handleRemoveTrack(t: PlaylistTrack) {
-  removingTrackId.value = t.id;
-  const physical = Boolean(removeTrackPhysicalMap.value[t.id]);
-  try {
-    const res = await api.removePlaylistTracks(props.playlistName, [t.id], physical);
-    if (res.ok) {
-      showToast(`已将“${t.title}”移出歌单${physical ? '，并删除本地文件' : ''}。`, 'success');
-      playlistTracks.value = playlistTracks.value.filter(item => item.id !== t.id);
-      selectedTrackIds.value.delete(t.id);
-      delete removeTrackPhysicalMap.value[t.id];
-      emit('tracks-changed', {
-        playlistName: props.playlistName,
-        remainingCount: playlistTracks.value.length
-      });
-    } else {
-      showToast(res.error || '移出失败', 'error');
-    }
-  } catch (e: any) {
-    showToast(`移出歌曲失败：${e.message}`, 'error');
   } finally {
-    removingTrackId.value = null;
+    if (seq === loadSeq) {
+      loadingTracks.value = false;
+    }
   }
 }
 
 async function handleBatchRemoveTracks() {
+  if (!canManage.value) return;
   const ids = Array.from(selectedTrackIds.value);
   if (ids.length === 0) return;
+  const deletePhysical = Boolean(props.currentUser?.isAdmin && batchRemovePhysical.value);
+  const summary = currentSummary.value;
   isBatchRemoving.value = true;
   try {
     const res = await api.removePlaylistTracks(
       props.playlistName,
       ids,
-      batchRemovePhysical.value
+      deletePhysical,
+      summary?.id,
+      summary?.playlist_ids
     );
     if (res.ok) {
       showToast(
-        `已移出 ${ids.length} 首歌曲${batchRemovePhysical.value ? '，并删除本地文件' : ''}。`,
+        `已移出 ${ids.length} 首歌曲${deletePhysical ? '，并删除本地文件' : ''}。`,
         'success'
       );
       playlistTracks.value = playlistTracks.value.filter(
@@ -342,6 +358,7 @@ async function handleBatchRemoveTracks() {
       selectedTrackIds.value = new Set();
       batchRemovePhysical.value = false;
       emit('tracks-changed', {
+        playlistId: summary?.id,
         playlistName: props.playlistName,
         remainingCount: playlistTracks.value.length
       });
@@ -356,19 +373,17 @@ async function handleBatchRemoveTracks() {
 }
 
 watch(
-  () => [props.open, props.playlistName],
+  () => [props.open, props.playlistName, props.playlistSummary?.id],
   ([newOpen, newName]) => {
     if (newOpen && newName) {
       trackSearchKw.value = '';
       filterReusedOnly.value = false;
       selectedTrackIds.value = new Set();
-      removeTrackPhysicalMap.value = {};
       batchRemovePhysical.value = false;
       if (!props.playlistSummary) {
         matchedSummary.value = null;
-        fetchMatchedSummary(newName as string);
       }
-      fetchPlaylistTracks(newName as string);
+      loadModalData(newName as string);
     }
   },
   { immediate: true }
@@ -389,7 +404,6 @@ watch(
           <div class="flex items-center gap-3 min-w-0">
             <!-- 歌单封面小图 -->
             <div class="relative w-12 h-12 sm:w-14 sm:h-14 rounded-xl overflow-hidden border border-border/80 bg-muted/60 shrink-0 shadow-sm">
-              <!-- 优先使用飞牛官方缓存 cover_guid -->
               <img
                 v-if="currentSummary?.cover_guid && coverAvailable('playlist', currentSummary.cover_guid)"
                 :src="coverUrl('playlist', currentSummary.cover_guid)"
@@ -398,7 +412,6 @@ watch(
                 loading="lazy"
                 @error="markCoverFailed('playlist', currentSummary?.cover_guid)"
               />
-              <!-- 兜底使用历史导入记录自带的网络封面 -->
               <img
                 v-else-if="props.historyItem?.cover && !failedCoverKeys.has(`history:${props.historyItem.id}`)"
                 :src="props.historyItem.cover"
@@ -406,7 +419,7 @@ watch(
                 class="w-full h-full object-cover"
                 loading="lazy"
                 referrerpolicy="no-referrer"
-                @error="failedCoverKeys.add(`history:${props.historyItem.id}`)"
+                @error="markCoverFailed('history', props.historyItem?.id)"
               />
               <div v-else class="w-full h-full flex items-center justify-center bg-primary/10 text-primary">
                 <ListMusic class="w-6 h-6" />
@@ -445,15 +458,17 @@ watch(
               placeholder="搜索歌单内曲目或歌手..."
               class="pl-9 pr-8 h-8 text-xs bg-muted/80"
             />
-            <button
+            <Button
               v-if="trackSearchKw"
               type="button"
+              variant="ghost"
+              size="iconSm"
               @click="trackSearchKw = ''"
-              class="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground p-0.5 rounded-full"
+              class="absolute right-1.5 top-1/2 -translate-y-1/2 h-6 w-6 text-muted-foreground hover:text-foreground rounded-full"
               title="清空"
             >
               <X class="w-3 h-3" />
-            </button>
+            </Button>
           </div>
         </div>
 
@@ -478,9 +493,13 @@ watch(
       </DialogHeader>
 
       <!-- 工具条：全选 / 统计 / 快速复用过滤 -->
-      <div class="flex items-center justify-between px-5 py-2.5 bg-muted/65 border-b border-border text-xs text-muted-foreground shrink-0">
+      <div
+        v-if="canManage || reusedCount > 0"
+        class="flex items-center justify-between px-5 py-2.5 bg-muted/65 border-b border-border text-xs text-muted-foreground shrink-0"
+      >
         <div class="flex items-center gap-2">
           <Button
+            v-if="canManage"
             variant="ghost"
             size="sm"
             class="h-7 px-2 text-muted-foreground"
@@ -503,17 +522,17 @@ watch(
           </Button>
         </div>
 
-        <span v-if="selectedTrackIds.size > 0" class="text-primary font-medium">
+        <span v-if="canManage && selectedTrackIds.size > 0" class="text-primary font-medium">
           已选中 {{ selectedTrackIds.size }} 首
         </span>
-        <span v-else class="text-muted-foreground text-[11px]">
-          点按歌曲选择，可批量移出或彻底删除
+        <span v-else-if="canManage" class="text-muted-foreground text-[11px]">
+          点按歌曲可批量移出
         </span>
       </div>
 
       <!-- 歌曲列表主体 -->
       <div
-        class="p-4 overflow-y-auto overflow-x-hidden space-y-1 flex-1 scrollbar-thin select-text relative min-h-[260px]"
+        class="p-4 overflow-y-auto overflow-x-hidden space-y-1 flex-1 custom-scrollbar select-text relative min-h-[260px]"
         :class="selectedTrackIds.size > 0 ? 'pb-24' : 'pb-6'"
       >
         <div v-if="loadingTracks" class="py-16 text-center text-muted-foreground">
@@ -523,7 +542,7 @@ watch(
 
         <div v-else-if="loadTracksError" class="py-16 text-center text-muted-foreground space-y-2">
           <p class="text-xs text-destructive">{{ loadTracksError }}</p>
-          <Button variant="outline" size="sm" class="h-7 text-xs" @click="fetchPlaylistTracks(props.playlistName)">
+          <Button variant="outline" size="sm" class="h-7 text-xs" @click="loadModalData(props.playlistName)">
             <RefreshCw class="w-3.5 h-3.5 mr-1" /> 重试
           </Button>
         </div>
@@ -551,12 +570,13 @@ watch(
             :key="t.id"
             :class="[
               'media-list-row media-list-row--track',
-              { 'media-list-row--selected': selectedTrackIds.has(t.id) }
+              { 'media-list-row--selected': canManage && selectedTrackIds.has(t.id) },
+              { 'cursor-default': !canManage }
             ]"
-            role="button"
-            tabindex="0"
-            :aria-pressed="selectedTrackIds.has(t.id)"
-            :aria-label="`${selectedTrackIds.has(t.id) ? '取消选择' : '选择'}歌曲 ${t.title}`"
+            :role="canManage ? 'button' : undefined"
+            :tabindex="canManage ? 0 : undefined"
+            :aria-pressed="canManage ? selectedTrackIds.has(t.id) : undefined"
+            :aria-label="canManage ? `${selectedTrackIds.has(t.id) ? '取消选择' : '选择'}歌曲 ${t.title}` : undefined"
             @click="toggleSelectTrack(t.id)"
             @keydown.enter.prevent="toggleSelectTrack(t.id)"
             @keydown.space.prevent="toggleSelectTrack(t.id)"
@@ -613,7 +633,7 @@ watch(
 
             <!-- 多选模式下的右侧对勾指示 -->
             <div
-              v-if="selectedTrackIds.size > 0"
+              v-if="canManage && selectedTrackIds.size > 0"
               class="media-list-row__desktop-action pointer-events-none pr-1"
             >
               <Checkbox
@@ -626,9 +646,9 @@ watch(
         </div>
       </div>
 
-      <!-- 底部浮动批量操作栏（通用组件复用，与歌单列表/曲库/历史记录完全统一） -->
+      <!-- 底部浮动批量操作栏 -->
       <BatchActionBar
-        :show="selectedTrackIds.size > 0"
+        :show="Boolean(canManage && selectedTrackIds.size > 0)"
         :count="selectedTrackIds.size"
         unit="首"
         :size-text="selectedTracksTotalSize ? formatBytes(selectedTracksTotalSize) : undefined"
@@ -642,7 +662,10 @@ watch(
         @confirm="handleBatchRemoveTracks"
       >
         <template #extra>
-          <label class="mt-2 flex cursor-pointer select-none items-center gap-2 rounded-xl border border-destructive/25 bg-destructive/10 p-2 text-[11px] text-destructive">
+          <label
+            v-if="props.currentUser?.isAdmin"
+            class="mt-2 flex cursor-pointer select-none items-center gap-2 rounded-xl border border-destructive/25 bg-destructive/10 p-2 text-[11px] text-destructive"
+          >
             <Checkbox v-model="batchRemovePhysical" />
             <span>同时从 NAS 物理彻底删除音频与歌词文件</span>
           </label>

@@ -1,8 +1,17 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
-import type { HistoryItem } from '../../types';
+import type { HistoryItem, CurrentUser } from '../../types';
 import { api } from '../../api';
 import { showToast } from '../../composables/useToast';
+
+const props = defineProps<{
+  currentUser?: CurrentUser | null;
+  refreshKey?: number;
+}>();
+
+const emit = defineEmits<{
+  (e: 'selection-change', val: boolean): void;
+}>();
 import PlaylistTracksModal from '../modals/PlaylistTracksModal.vue';
 import BatchActionBar from '@/components/ui/BatchActionBar.vue';
 import { Button } from '@/components/ui/button';
@@ -143,12 +152,19 @@ function toggleSelectHistory(id: number) {
   selectedHistoryIds.value = next;
 }
 
+const isAllHistorySelected = computed(() =>
+  filteredHistory.value.length > 0 &&
+  filteredHistory.value.every(h => selectedHistoryIds.value.has(h.id))
+);
+
 function toggleSelectAllHistory() {
-  if (selectedHistoryIds.value.size === filteredHistory.value.length && filteredHistory.value.length > 0) {
-    selectedHistoryIds.value = new Set();
+  const next = new Set(selectedHistoryIds.value);
+  if (isAllHistorySelected.value) {
+    for (const h of filteredHistory.value) next.delete(h.id);
   } else {
-    selectedHistoryIds.value = new Set(filteredHistory.value.map(h => h.id));
+    for (const h of filteredHistory.value) next.add(h.id);
   }
+  selectedHistoryIds.value = next;
 }
 
 async function handleBatchDeleteHistory() {
@@ -158,11 +174,21 @@ async function handleBatchDeleteHistory() {
   isBatchDeleting.value = true;
   try {
     const results = await Promise.all(targetIds.map(id => api.deleteHistory(id)));
-    const successCount = results.filter(r => r.ok).length;
-    const targetSet = new Set(targetIds);
-    history.value = history.value.filter(h => !targetSet.has(h.id));
-    selectedHistoryIds.value = new Set();
-    showToast(`已清除 ${successCount} 条下载记录。`, 'success');
+    const succeededIds = new Set(targetIds.filter((_, idx) => results[idx]?.ok));
+    const failedCount = targetIds.length - succeededIds.size;
+    if (succeededIds.size > 0) {
+      history.value = history.value.filter(h => !succeededIds.has(h.id));
+      selectedHistoryIds.value = new Set(
+        targetIds.filter(id => !succeededIds.has(id))
+      );
+    }
+    if (failedCount === 0) {
+      showToast(`已清除 ${succeededIds.size} 条下载记录。`, 'success');
+    } else if (succeededIds.size > 0) {
+      showToast(`已清除 ${succeededIds.size} 条记录，${failedCount} 条失败。`, 'warning');
+    } else {
+      showToast('清除下载记录失败', 'error');
+    }
   } catch (e: any) {
     showToast(`批量清除记录失败: ${e.message}`, 'error');
   } finally {
@@ -217,6 +243,14 @@ watch([activeFilter, searchKw], () => {
   displayLimit.value = 20;
 });
 
+watch(() => props.refreshKey, () => {
+  fetchHistory(true);
+});
+
+watch(() => selectedHistoryIds.value.size > 0, (val) => {
+  emit('selection-change', val);
+});
+
 onMounted(() => {
   fetchHistory();
 });
@@ -261,10 +295,6 @@ function formatDate(iso?: string) {
   const min = String(d.getMinutes()).padStart(2, '0');
   return isSameYear ? `${m}/${day} ${hour}:${min}` : `${d.getFullYear()}/${m}/${day} ${hour}:${min}`;
 }
-
-onMounted(() => {
-  fetchHistory();
-});
 </script>
 
 <template>
@@ -311,7 +341,7 @@ onMounted(() => {
           class="h-7 px-2 text-muted-foreground text-[11px] sm:text-xs"
           @click="toggleSelectAllHistory"
         >
-          {{ selectedHistoryIds.size === filteredHistory.length && filteredHistory.length > 0 ? '取消全选' : '全选' }}
+          {{ isAllHistorySelected ? '取消全选' : '全选' }}
         </Button>
         <span class="text-muted-foreground/50">|</span>
         <span class="text-muted-foreground text-[11px] sm:text-xs">
@@ -533,6 +563,7 @@ onMounted(() => {
       v-model:open="tracksModalOpen"
       :playlist-name="activePlaylistName"
       :history-item="activeHistoryItem"
+      :current-user="currentUser"
     />
   </div>
 </template>

@@ -1,5 +1,5 @@
 <script setup lang="ts" generic="T extends string | number">
-import { ref, watch, type HTMLAttributes } from 'vue';
+import { nextTick, ref, watch, type HTMLAttributes } from 'vue';
 import { cn } from '@/lib/utils';
 import { useSpringInertia } from '@/composables/useSpringInertia';
 
@@ -45,12 +45,23 @@ watch(() => props.modelValue, (val) => {
   localValue.value = val;
 });
 
-const { isReady, updateIndicator } = useSpringInertia(
+const { isReady, updateIndicator, measureRects } = useSpringInertia(
   containerRef,
   sliderRef,
   itemRefs,
   {
     getActiveIndex: () => props.items.findIndex(item => item.value === localValue.value),
+  }
+);
+
+watch(
+  () => props.items.map(i => `${String(i.value)}:${i.label}:${i.badge ?? ''}`).join('|'),
+  () => {
+    itemRefs.value.length = props.items.length;
+    nextTick(() => {
+      measureRects();
+      updateIndicator(true);
+    });
   }
 );
 
@@ -101,7 +112,7 @@ watch(() => props.modelValue, (newVal, oldVal) => {
         :class="cn(
           'spring-tabs-pill w-[calc(100%-6px)] mx-[3px] h-full rounded-lg transition-colors',
           variant === 'primary'
-            ? 'bg-primary/12 border border-primary/25 shadow-[0_0_12px_-2px_hsl(var(--primary)/0.2)]'
+            ? 'bg-primary/15 border border-primary/25 shadow-[0_0_12px_-2px_hsl(var(--primary)/0.2)]'
             : 'bg-card text-foreground shadow-sm ring-1 ring-border/60',
           props.pillClass
         )"
@@ -143,7 +154,7 @@ watch(() => props.modelValue, (newVal, oldVal) => {
         <span
           v-if="item.badge !== undefined && item.badge !== null"
           :class="cn(
-            'font-mono rounded-full px-1.5 py-0.2 text-[10px] leading-tight shrink-0 transition-colors',
+            'font-mono rounded-full px-1.5 py-0.5 text-[10px] leading-tight shrink-0 transition-colors',
             item.badgeClass || (localValue === item.value ? 'bg-muted text-foreground' : 'bg-muted/60 text-muted-foreground')
           )"
         >

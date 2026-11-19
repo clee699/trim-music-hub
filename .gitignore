@@ -1,8 +1,13 @@
 # Runtime and local data (DO NOT commit or publish)
 data/
 *.log
-.env.local
-.env.*.local
+*.pid
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
 
 # Dependencies
 node_modules/
@@ -11,6 +16,10 @@ frontend/node_modules/
 # Build artifacts
 dist/
 frontend/dist/
+*.fpk
+*.fpk.sha256
+packaging/fpk/.build/
+.tools/
 
 # Python cache
 __pycache__/

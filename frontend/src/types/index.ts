@@ -68,7 +68,7 @@ export interface SettingsData {
   download_dir?: string;
   concurrent_downloads?: number;
   force_transcode?: boolean;
-  transcode_quality?: 'flac' | '320k' | '128k';
+  transcode_quality?: 'flac24bit' | 'flac' | '320k' | '128k';
   is_configured?: boolean;
   effective_music_dir?: string;
   available_sources: Array<{
@@ -143,6 +143,8 @@ export interface QueueTask {
 }
 
 export interface TaskState {
+  task_id?: string;
+  owner_user?: string;
   status: 'idle' | 'parsing' | 'downloading' | 'finalizing' | 'success' | 'failed' | 'stopped';
   playlist_name: string;
   platform: string;
@@ -158,6 +160,7 @@ export interface TaskState {
   start_time: string | null;
   end_time: string | null;
   tracks: TaskTrack[];
+  track_update?: { index: number; track: TaskTrack };
   updated_at: string;
 }
 
@@ -203,6 +206,8 @@ export interface SearchSong {
 }
 
 export interface PlaylistSummary {
+  id?: number;
+  playlist_ids?: number[];
   name: string;
   cover_guid?: string;
   created_at?: string;
@@ -210,6 +215,8 @@ export interface PlaylistSummary {
   m3u_exists?: boolean;
   users: string | Array<{ id: number; name: string }>;
   user_ids?: number[];
+  is_public?: boolean;
+  can_manage?: boolean;
   track_count: number;
 }
 
@@ -289,6 +296,7 @@ export interface HistoryItem {
   end_time: string;
   duration: number;
   status?: string;
+  owner_user?: string;
   operator?: string;
   tracks?: Array<{
     title: string;

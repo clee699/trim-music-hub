@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
+import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import type { LibraryTrack, DuplicateGroup, CurrentUser } from '../../types';
-import { api } from '../../api';
-
-defineProps<{ currentUser?: CurrentUser | null }>();
+import { api, resolveApiUrl } from '../../api';
 import { showToast } from '../../composables/useToast';
+
+const props = defineProps<{ currentUser?: CurrentUser | null }>();
+const emit = defineEmits<{
+  (e: 'selection-change', val: boolean): void;
+}>();
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -25,7 +28,6 @@ import {
   CheckCircle2,
   Sparkles,
   Layers,
-  HardDrive,
 } from 'lucide-vue-next';
 
 // 视图切换：全部曲目 vs 查重管理
@@ -56,6 +58,7 @@ const limit = 50;
 const isInitialLoading = ref(false);
 const isLoadingMore = ref(false);
 const selectedAllTrackIds = ref<Set<number>>(new Set());
+let searchSeq = 0;
 
 // 2. 查重模式状态
 const duplicateKw = ref('');
@@ -64,6 +67,11 @@ const duplicateGroupsCount = ref(0);
 const duplicateTotalTracks = ref(0);
 const isLoadingDuplicates = ref(false);
 const selectedDupTrackIds = ref<Set<number>>(new Set());
+let dupSeq = 0;
+
+// 列表滚动引用
+const allListRef = ref<InstanceType<typeof PullRefreshList> | null>(null);
+const dupListRef = ref<InstanceType<typeof PullRefreshList> | null>(null);
 
 // 通用状态
 const failedCoverGuids = ref<Set<string>>(new Set());
@@ -72,20 +80,39 @@ const isBatchDeleting = ref(false);
 
 const showBackToTop = ref(false);
 const hasActiveSelection = computed(() =>
-  activeSubTab.value === 'all'
-    ? selectedAllTrackIds.value.size > 0
-    : selectedDupTrackIds.value.size > 0
+  Boolean(props.currentUser?.isAdmin) && (
+    activeSubTab.value === 'all'
+      ? selectedAllTrackIds.value.size > 0
+      : selectedDupTrackIds.value.size > 0
+  )
 );
+
+watch(hasActiveSelection, (val) => {
+  emit('selection-change', val);
+});
+
+watch(() => props.currentUser?.isAdmin, (isAdmin) => {
+  if (!isAdmin) {
+    selectedAllTrackIds.value = new Set();
+    selectedDupTrackIds.value = new Set();
+  }
+});
 
 const hasMore = computed(() => {
   return tracks.value.length < totalCount.value;
 });
 
+const isAllTracksSelected = computed(() =>
+  tracks.value.length > 0 && tracks.value.every(t => selectedAllTrackIds.value.has(t.id))
+);
+
 const isPullRefreshing = ref(false);
 
 async function refreshAllTracks() {
+  const seq = ++searchSeq;
   try {
     const res = await api.searchLibraryTracks(searchKw.value.trim(), 1, limit);
+    if (seq !== searchSeq) return;
     if (res.ok) {
       tracks.value = res.data.list || [];
       totalCount.value = res.data.total || 0;
@@ -94,13 +121,17 @@ async function refreshAllTracks() {
       showToast('曲库刷新失败', 'error');
     }
   } catch (e: any) {
-    showToast(`曲库刷新失败：${e.message}`, 'error');
+    if (seq === searchSeq) {
+      showToast(`曲库刷新失败：${e.message}`, 'error');
+    }
   }
 }
 
 async function refreshDuplicates() {
+  const seq = ++dupSeq;
   try {
     const res = await api.getDuplicateTracks(duplicateKw.value.trim());
+    if (seq !== dupSeq) return;
     if (res.ok) {
       duplicateGroups.value = res.data.groups || [];
       duplicateGroupsCount.value = res.data.groups_count || 0;
@@ -109,7 +140,9 @@ async function refreshDuplicates() {
       showToast('获取查重数据失败', 'error');
     }
   } catch (e: any) {
-    showToast(`刷新查重数据失败：${e.message}`, 'error');
+    if (seq === dupSeq) {
+      showToast(`刷新查重数据失败：${e.message}`, 'error');
+    }
   }
 }
 
@@ -128,6 +161,7 @@ async function onPullRefresh() {
 
 // ================= 全部曲目逻辑 =================
 async function handleSearch(resetPage = true) {
+  const seq = ++searchSeq;
   if (resetPage) {
     page.value = 1;
     tracks.value = [];
@@ -136,52 +170,65 @@ async function handleSearch(resetPage = true) {
   isInitialLoading.value = true;
   try {
     const res = await api.searchLibraryTracks(searchKw.value.trim(), 1, limit);
+    if (seq !== searchSeq) return;
     if (res.ok) {
       tracks.value = res.data.list || [];
       totalCount.value = res.data.total || 0;
       nextTick(() => {
-        if (typeof window !== 'undefined') {
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        }
+        allListRef.value?.scrollToTop({ behavior: 'smooth' });
       });
     } else {
       showToast('曲库检索失败', 'error');
     }
   } catch (e: any) {
-    showToast(`检索曲库失败：${e.message}`, 'error');
+    if (seq === searchSeq) {
+      showToast(`检索曲库失败：${e.message}`, 'error');
+    }
   } finally {
-    isInitialLoading.value = false;
+    if (seq === searchSeq) {
+      isInitialLoading.value = false;
+    }
   }
 }
 
 async function loadMore() {
   if (isInitialLoading.value || isLoadingMore.value || !hasMore.value) return;
 
+  const seq = searchSeq;
   isLoadingMore.value = true;
   const nextPage = page.value + 1;
   try {
     const res = await api.searchLibraryTracks(searchKw.value.trim(), nextPage, limit);
+    if (seq !== searchSeq) return;
     if (res.ok && res.data.list?.length) {
       page.value = nextPage;
       tracks.value.push(...res.data.list);
       totalCount.value = res.data.total || totalCount.value;
     }
   } catch (e: any) {
-    showToast(`加载更多失败: ${e.message}`, 'error');
+    if (seq === searchSeq) {
+      showToast(`加载更多失败: ${e.message}`, 'error');
+    }
   } finally {
-    isLoadingMore.value = false;
+    if (seq === searchSeq) {
+      isLoadingMore.value = false;
+    }
   }
 }
 
 function toggleSelectAllTracks() {
-  if (selectedAllTrackIds.value.size === tracks.value.length && tracks.value.length > 0) {
-    selectedAllTrackIds.value = new Set();
+  if (!props.currentUser?.isAdmin) return;
+  const next = new Set(selectedAllTrackIds.value);
+  if (isAllTracksSelected.value) {
+    for (const t of tracks.value) next.delete(t.id);
   } else {
-    selectedAllTrackIds.value = new Set(tracks.value.map(t => t.id));
+    for (const t of tracks.value) next.add(t.id);
   }
+  selectedAllTrackIds.value = next;
 }
 
 function toggleTrackSelect(id: number) {
+  if (!props.currentUser?.isAdmin) return;
   const next = new Set(selectedAllTrackIds.value);
   if (next.has(id)) {
     next.delete(id);
@@ -193,9 +240,11 @@ function toggleTrackSelect(id: number) {
 
 // ================= 查重模式逻辑 =================
 async function loadDuplicates() {
+  const seq = ++dupSeq;
   isLoadingDuplicates.value = true;
   try {
     const res = await api.getDuplicateTracks(duplicateKw.value.trim());
+    if (seq !== dupSeq) return;
     if (res.ok) {
       duplicateGroups.value = res.data.groups || [];
       duplicateGroupsCount.value = res.data.groups_count || 0;
@@ -204,9 +253,13 @@ async function loadDuplicates() {
       showToast('获取查重数据失败', 'error');
     }
   } catch (e: any) {
-    showToast(`查找重复歌曲失败：${e.message}`, 'error');
+    if (seq === dupSeq) {
+      showToast(`查找重复歌曲失败：${e.message}`, 'error');
+    }
   } finally {
-    isLoadingDuplicates.value = false;
+    if (seq === dupSeq) {
+      isLoadingDuplicates.value = false;
+    }
   }
 }
 
@@ -222,6 +275,7 @@ function getBestTrackInGroup(group: DuplicateGroup): LibraryTrack | null {
 
 // 智能标记所有非最高品质副本
 function smartSelectSuboptimalDuplicates() {
+  if (!props.currentUser?.isAdmin) return;
   const newSet = new Set<number>();
   for (const g of duplicateGroups.value) {
     const best = getBestTrackInGroup(g);
@@ -239,6 +293,7 @@ function smartSelectSuboptimalDuplicates() {
 
 // 智能标记历史旧版本（保留最新添加的版本）
 function smartSelectOlderDuplicates() {
+  if (!props.currentUser?.isAdmin) return;
   const newSet = new Set<number>();
   for (const g of duplicateGroups.value) {
     if (!g.tracks || g.tracks.length <= 1) continue;
@@ -258,6 +313,7 @@ function smartSelectOlderDuplicates() {
 
 // 单组快捷：保留本组最高音质
 function selectGroupSuboptimal(group: DuplicateGroup) {
+  if (!props.currentUser?.isAdmin) return;
   const best = getBestTrackInGroup(group);
   const next = new Set(selectedDupTrackIds.value);
   for (const t of group.tracks) {
@@ -272,6 +328,7 @@ function selectGroupSuboptimal(group: DuplicateGroup) {
 
 // 单组快捷：切换全选本组
 function toggleGroupAll(group: DuplicateGroup) {
+  if (!props.currentUser?.isAdmin) return;
   const next = new Set(selectedDupTrackIds.value);
   const allGroupSelected = group.tracks.every(t => next.has(t.id));
   for (const t of group.tracks) {
@@ -285,6 +342,7 @@ function toggleGroupAll(group: DuplicateGroup) {
 }
 
 function toggleDupTrackSelect(id: number) {
+  if (!props.currentUser?.isAdmin) return;
   const next = new Set(selectedDupTrackIds.value);
   if (next.has(id)) {
     next.delete(id);
@@ -336,7 +394,11 @@ async function confirmDeleteTrack(t: LibraryTrack) {
       // 更新全部曲目
       tracks.value = tracks.value.filter(item => item.id !== t.id);
       totalCount.value = Math.max(0, totalCount.value - 1);
-      selectedAllTrackIds.value.delete(t.id);
+      if (selectedAllTrackIds.value.has(t.id)) {
+        const nextAll = new Set(selectedAllTrackIds.value);
+        nextAll.delete(t.id);
+        selectedAllTrackIds.value = nextAll;
+      }
 
       // 更新查重曲目
       for (const g of duplicateGroups.value) {
@@ -345,7 +407,11 @@ async function confirmDeleteTrack(t: LibraryTrack) {
       }
       duplicateGroups.value = duplicateGroups.value.filter(g => g.tracks.length > 1);
       duplicateGroupsCount.value = duplicateGroups.value.length;
-      selectedDupTrackIds.value.delete(t.id);
+      if (selectedDupTrackIds.value.has(t.id)) {
+        const nextDup = new Set(selectedDupTrackIds.value);
+        nextDup.delete(t.id);
+        selectedDupTrackIds.value = nextDup;
+      }
     } else {
       showToast(res.error || '删除失败', 'error');
     }
@@ -394,16 +460,13 @@ async function handleBatchDelete(mode: 'all' | 'duplicates') {
 }
 
 // ================= 辅助函数与生命周期 =================
-function handleWindowScroll() {
-  if (typeof window !== 'undefined') {
-    showBackToTop.value = window.scrollY > 300;
-  }
+function onListScroll(scrollTop: number) {
+  showBackToTop.value = scrollTop > 300;
 }
 
 function scrollToTop() {
-  if (typeof window !== 'undefined') {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
+  const list = activeSubTab.value === 'all' ? allListRef.value : dupListRef.value;
+  list?.scrollToTop({ behavior: 'smooth' });
 }
 
 function formatBytes(bytes?: number) {
@@ -424,7 +487,7 @@ function formatDuration(ms?: number) {
 }
 
 function trackCoverUrl(guid?: string) {
-  return guid ? `/api/covers/track/${encodeURIComponent(guid)}?size=160` : '';
+  return guid ? resolveApiUrl(`/api/covers/track/${encodeURIComponent(guid)}?size=160`) : '';
 }
 
 function trackCoverAvailable(guid?: string) {
@@ -440,16 +503,14 @@ function markTrackCoverFailed(guid?: string) {
 
 // 监听 Tab 切换
 watch(activeSubTab, (val) => {
-  showBackToTop.value = false;
+  const list = val === 'all' ? allListRef.value : dupListRef.value;
+  showBackToTop.value = (list?.getScrollTop() || 0) > 300;
   if (val === 'duplicates' && duplicateGroups.value.length === 0 && !isLoadingDuplicates.value) {
     loadDuplicates();
   }
 });
 
 onMounted(() => {
-  if (typeof window !== 'undefined') {
-    window.addEventListener('scroll', handleWindowScroll, { passive: true });
-  }
   handleSearch(true);
   // 预取查重统计
   api.getDuplicateTracks('').then(res => {
@@ -458,12 +519,6 @@ onMounted(() => {
       duplicateTotalTracks.value = res.data.total_tracks || 0;
     }
   }).catch(() => {});
-});
-
-onUnmounted(() => {
-  if (typeof window !== 'undefined') {
-    window.removeEventListener('scroll', handleWindowScroll);
-  }
 });
 </script>
 
@@ -543,16 +598,18 @@ onUnmounted(() => {
       <!-- 固定的列表头部信息栏 (固定在顶部不随列表滚动) -->
       <div class="flex items-center justify-between px-1 text-xs shrink-0 gap-2">
         <div class="flex items-center gap-2 sm:gap-3 flex-wrap min-w-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            class="h-7 px-2 text-muted-foreground text-[11px] sm:text-xs"
-            :disabled="tracks.length === 0"
-            @click="toggleSelectAllTracks"
-          >
-            {{ selectedAllTrackIds.size === tracks.length && tracks.length > 0 ? '取消全选' : '全选' }}
-          </Button>
-          <span class="text-muted-foreground/50">|</span>
+          <template v-if="currentUser?.isAdmin">
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-7 px-2 text-muted-foreground text-[11px] sm:text-xs"
+              :disabled="tracks.length === 0"
+              @click="toggleSelectAllTracks"
+            >
+              {{ isAllTracksSelected ? '取消全选' : '全选' }}
+            </Button>
+            <span class="text-muted-foreground/50">|</span>
+          </template>
           <span class="text-muted-foreground hidden sm:inline">
             匹配总数: <strong class="text-foreground font-mono text-sm">{{ totalCount }}</strong> 首
           </span>
@@ -563,7 +620,7 @@ onUnmounted(() => {
           <span class="text-muted-foreground hidden sm:inline">
             已载入: <strong class="text-primary font-mono">{{ tracks.length }}</strong> 首
           </span>
-          <span v-if="selectedAllTrackIds.size > 0" class="text-warning font-medium text-[11px] sm:text-xs">
+          <span v-if="currentUser?.isAdmin && selectedAllTrackIds.size > 0" class="text-warning font-medium text-[11px] sm:text-xs">
             已选 {{ selectedAllTrackIds.size }} 首 <span class="hidden sm:inline">({{ formatBytes(selectedAllTotalBytes) }})</span>
           </span>
         </div>
@@ -577,8 +634,10 @@ onUnmounted(() => {
 
       <!-- 只有列表滚动，内置下拉刷新 -->
       <PullRefreshList
+        ref="allListRef"
         :refreshing="isPullRefreshing"
         @refresh="onPullRefresh"
+        @scroll="onListScroll"
         class="custom-scrollbar pr-0.5"
       >
         <section class="space-y-3 pb-6">
@@ -609,12 +668,13 @@ onUnmounted(() => {
           :key="t.id"
           :class="[
             'media-list-row media-list-row--track',
-            { 'media-list-row--selected': selectedAllTrackIds.has(t.id) }
+            { 'media-list-row--selected': currentUser?.isAdmin && selectedAllTrackIds.has(t.id) },
+            { 'cursor-default': !currentUser?.isAdmin }
           ]"
-          role="button"
-          tabindex="0"
-          :aria-pressed="selectedAllTrackIds.has(t.id)"
-          :aria-label="`${selectedAllTrackIds.has(t.id) ? '取消选择' : '选择'}歌曲 ${t.title}`"
+          :role="currentUser?.isAdmin ? 'button' : undefined"
+          :tabindex="currentUser?.isAdmin ? 0 : undefined"
+          :aria-pressed="currentUser?.isAdmin ? selectedAllTrackIds.has(t.id) : undefined"
+          :aria-label="currentUser?.isAdmin ? `${selectedAllTrackIds.has(t.id) ? '取消选择' : '选择'}歌曲 ${t.title}` : undefined"
           @click="toggleTrackSelect(t.id)"
           @keydown.enter.prevent="toggleTrackSelect(t.id)"
           @keydown.space.prevent="toggleTrackSelect(t.id)"
@@ -650,7 +710,7 @@ onUnmounted(() => {
 
           <!-- 右侧物理删除操作：多选状态下切换为选择框，杜绝单曲操作冲突 -->
           <div
-            v-if="selectedAllTrackIds.size > 0"
+            v-if="currentUser?.isAdmin && selectedAllTrackIds.size > 0"
             class="media-list-row__desktop-action pointer-events-none pr-1"
           >
             <Checkbox
@@ -721,44 +781,46 @@ onUnmounted(() => {
             <span class="text-muted-foreground font-normal font-mono">({{ duplicateTotalTracks }} 首文件)</span>
           </span>
 
-          <span class="text-muted-foreground/75 hidden sm:inline">|</span>
+          <template v-if="currentUser?.isAdmin">
+            <span class="text-muted-foreground/75 hidden sm:inline">|</span>
 
-          <!-- 智能一键工具 -->
-          <div class="flex items-center gap-1.5">
-            <Button
-              variant="secondary"
-              size="sm"
-              @click="smartSelectSuboptimalDuplicates"
-              class="h-7 text-[11px] px-2.5 bg-warning/10 hover:bg-warning/20 text-warning border border-warning/30 flex items-center gap-1"
-              title="为每组曲目自动保留最高品质/最大体积版本，勾选其余副本待删除"
-            >
-              <Sparkles class="w-3 h-3 text-warning" />
-              <span>选中较差版本</span>
-            </Button>
+            <!-- 智能一键工具 -->
+            <div class="flex items-center gap-1.5">
+              <Button
+                variant="secondary"
+                size="sm"
+                @click="smartSelectSuboptimalDuplicates"
+                class="h-7 text-[11px] px-2.5 bg-warning/10 hover:bg-warning/20 text-warning border border-warning/30 flex items-center gap-1"
+                title="为每组曲目自动保留最高品质/最大体积版本，勾选其余副本待删除"
+              >
+                <Sparkles class="w-3 h-3 text-warning" />
+                <span>选中较差版本</span>
+              </Button>
 
-            <Button
-              variant="ghost"
-              size="sm"
-              @click="smartSelectOlderDuplicates"
-              class="h-7 text-[11px] px-2 text-muted-foreground hover:text-foreground"
-              title="保留每组最新添加的曲目，勾选旧版本待删除"
-            >
-              <span>保留最新</span>
-            </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                @click="smartSelectOlderDuplicates"
+                class="h-7 text-[11px] px-2 text-muted-foreground hover:text-foreground"
+                title="保留每组最新添加的曲目，勾选旧版本待删除"
+              >
+                <span>保留最新</span>
+              </Button>
 
-            <Button
-              v-if="selectedDupTrackIds.size > 0"
-              variant="ghost"
-              size="sm"
-              @click="clearDupSelection"
-              class="h-7 text-[11px] px-2 text-muted-foreground hover:text-destructive"
-            >
-              <span>清空勾选</span>
-            </Button>
-          </div>
+              <Button
+                v-if="selectedDupTrackIds.size > 0"
+                variant="ghost"
+                size="sm"
+                @click="clearDupSelection"
+                class="h-7 text-[11px] px-2 text-muted-foreground hover:text-destructive"
+              >
+                <span>清空勾选</span>
+              </Button>
+            </div>
+          </template>
         </div>
 
-        <div class="flex items-center gap-2 text-muted-foreground text-[11px]">
+        <div v-if="currentUser?.isAdmin" class="flex items-center gap-2 text-muted-foreground text-[11px]">
           <span v-if="selectedDupTrackIds.size > 0" class="text-destructive font-medium">
             已勾选待清理: {{ selectedDupTrackIds.size }} 首 ({{ formatBytes(selectedDupTotalBytes) }})
           </span>
@@ -770,8 +832,10 @@ onUnmounted(() => {
 
       <!-- 只有列表滚动，内置下拉刷新 -->
       <PullRefreshList
+        ref="dupListRef"
         :refreshing="isPullRefreshing"
         @refresh="onPullRefresh"
+        @scroll="onListScroll"
         class="custom-scrollbar pr-0.5"
       >
         <section class="space-y-4 pb-6 select-text">
@@ -811,7 +875,7 @@ onUnmounted(() => {
             </div>
 
             <!-- 本组快捷操作 -->
-            <div class="flex items-center gap-1.5 shrink-0">
+            <div v-if="currentUser?.isAdmin" class="flex items-center gap-1.5 shrink-0">
               <Button
                 variant="ghost"
                 size="sm"
@@ -840,7 +904,7 @@ onUnmounted(() => {
               :key="t.id"
               :class="[
                 'flex items-center justify-between gap-3 p-2.5 rounded-lg transition-all text-xs border border-transparent',
-                selectedDupTrackIds.has(t.id)
+                currentUser?.isAdmin && selectedDupTrackIds.has(t.id)
                   ? 'bg-rose-500/15 !border-rose-500/40'
                   : 'bg-muted/40 hover:bg-muted/70'
               ]"
@@ -848,6 +912,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3 overflow-hidden flex-1">
                 <!-- 勾选框：勾选代表标记待删除 -->
                 <Checkbox
+                  v-if="currentUser?.isAdmin"
                   :checked="selectedDupTrackIds.has(t.id)"
                   @update:checked="toggleDupTrackSelect(t.id)"
                   class="shrink-0"

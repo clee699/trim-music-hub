@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Popconfirm } from '@/components/ui/popconfirm';
+import { SpringTabs, type SpringTabItem } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
@@ -49,6 +50,14 @@ const targetType = ref<'public' | 'user'>('user');
 const targetUser = ref('');
 const userList = ref<Array<{ id: number; name: string }>>([]);
 
+const brokenImageUrls = ref<Set<string>>(new Set());
+function markImageBroken(url?: string) {
+  if (!url) return;
+  const next = new Set(brokenImageUrls.value);
+  next.add(url);
+  brokenImageUrls.value = next;
+}
+
 // 每日推荐与偏好配置状态
 const dailyRecommendPreview = ref<PlaylistPreview | null>(null);
 const loadingDailyRecommend = ref(false);
@@ -62,16 +71,51 @@ const dailySyncQuality = ref('flac');
 const dailySyncPlaylistName = ref('');
 
 // 管理员多账号视图切换 (全部 / 我的)
-const accountFilterTab = ref<'all' | 'my'>('all');
+type AccountFilter = 'all' | 'my';
+const accountFilterTab = ref<AccountFilter>('all');
+const accountFilterTabs: SpringTabItem<AccountFilter>[] = [
+  { value: 'all', label: '全部成员绑定账号' },
+  { value: 'my', label: '我的账号' },
+];
 
 // 登录方式与扫码状态
-const loginMode = ref<'qr' | 'cookie'>('qr');
+type LoginMode = 'qr' | 'cookie';
+const loginMode = ref<LoginMode>('qr');
+const loginModeTabs: SpringTabItem<LoginMode>[] = [
+  { value: 'qr', label: '扫码', icon: Smartphone },
+  { value: 'cookie', label: 'Cookie', icon: KeyRound },
+];
+
+type DailySyncMode = 'off' | 'on';
+const dailySyncModeTabs: SpringTabItem<DailySyncMode>[] = [
+  { value: 'off', label: '关闭' },
+  { value: 'on', label: '开启' },
+];
+const dailySyncMode = computed<DailySyncMode>({
+  get: () => (dailySyncEnabled.value ? 'on' : 'off'),
+  set: (val) => {
+    const next = val === 'on';
+    if (next !== dailySyncEnabled.value && !savingDailySettings.value) {
+      handleToggleDailySync(next);
+    }
+  },
+});
+
 const qrLoading = ref(false);
 const qrImg = ref('');
 const qrUnikey = ref('');
 const qrStatus = ref<'idle' | 'waiting' | 'scanned' | 'expired' | 'success'>('idle');
 const qrMessage = ref('');
 let qrPollTimer: ReturnType<typeof setInterval> | null = null;
+let qrPollInFlight = false;
+
+function handleLoginModeChange(mode: LoginMode) {
+  if (mode === 'qr') {
+    fetchNeteaseQr();
+  } else {
+    stopQrPoll();
+  }
+}
 
 const displayedAccounts = computed(() => {
   if (!props.currentUser?.isAdmin) {
@@ -108,7 +152,11 @@ async function loadUsers() {
     if (result.ok && result.data.length) {
       userList.value = result.data;
       const currentUsername = props.currentUser?.username;
-      // 优先使用当前选定云端账号绑定的飞牛成员
+      if (!props.currentUser?.isAdmin && currentUsername) {
+        targetType.value = 'user';
+        targetUser.value = currentUsername;
+        return;
+      }
       if (activeAccount.value?.owner_user) {
         targetType.value = 'user';
         targetUser.value = activeAccount.value.owner_user;
@@ -139,7 +187,7 @@ function formatSyncTime(isoStr?: string | null): string {
 function initAccountSettings(account: MusicAccount) {
   dailySyncEnabled.value = Boolean(account.daily_sync_enabled);
   dailySyncTime.value = account.daily_sync_time || '04:00';
-  dailySyncTarget.value = account.daily_sync_target || 'user';
+  dailySyncTarget.value = props.currentUser?.isAdmin ? (account.daily_sync_target || 'user') : 'user';
   dailySyncUser.value = account.daily_sync_user || account.owner_user || props.currentUser?.username || '';
   dailySyncQuality.value = account.daily_sync_quality || 'flac';
   dailySyncPlaylistName.value = account.daily_sync_playlist_name || '';
@@ -150,10 +198,11 @@ async function handleSaveDailySettings() {
   savingDailySettings.value = true;
   try {
     const targetId = activeAccount.value.id || activeAccount.value.provider;
+    const effectiveTarget = props.currentUser?.isAdmin ? dailySyncTarget.value : 'user';
     const res = await api.updateAccountSettings(targetId, {
       daily_sync_enabled: dailySyncEnabled.value,
       daily_sync_time: dailySyncTime.value,
-      daily_sync_target: dailySyncTarget.value,
+      daily_sync_target: effectiveTarget,
       daily_sync_user: dailySyncUser.value || activeAccount.value.owner_user || props.currentUser?.username || 'admin',
       daily_sync_quality: dailySyncQuality.value,
       daily_sync_playlist_name: dailySyncPlaylistName.value.trim()
@@ -229,9 +278,10 @@ async function chooseAccount(account: MusicAccount) {
   cookieInput.value = '';
   stopQrPoll();
 
-  // 默认可见范围严格优先读取当前云端音乐账号绑定的飞牛用户
   targetType.value = 'user';
-  if (account.owner_user) {
+  if (!props.currentUser?.isAdmin && props.currentUser?.username) {
+    targetUser.value = props.currentUser.username;
+  } else if (account.owner_user) {
     targetUser.value = account.owner_user;
   } else if (props.currentUser?.username) {
     targetUser.value = props.currentUser.username;
@@ -281,12 +331,16 @@ async function fetchNeteaseQr() {
 function startQrPoll() {
   stopQrPoll();
   qrPollTimer = setInterval(async () => {
+    if (qrPollInFlight) return;
     if (!qrUnikey.value || qrStatus.value === 'expired' || qrStatus.value === 'success') {
       stopQrPoll();
       return;
     }
+    qrPollInFlight = true;
+    const currentKey = qrUnikey.value;
     try {
-      const res = await api.checkNeteaseQr(qrUnikey.value);
+      const res = await api.checkNeteaseQr(currentKey);
+      if (qrUnikey.value !== currentKey) return;
       if (!res.ok) {
         qrStatus.value = 'expired';
         qrMessage.value = res.error || '扫码验证失败，请刷新重试';
@@ -320,6 +374,8 @@ function startQrPoll() {
       }
     } catch {
       // 忽略单次网络波动
+    } finally {
+      qrPollInFlight = false;
     }
   }, 1500);
 }
@@ -329,6 +385,7 @@ function stopQrPoll() {
     clearInterval(qrPollTimer);
     qrPollTimer = null;
   }
+  qrPollInFlight = false;
 }
 
 async function connectAccountByCookie() {
@@ -388,10 +445,11 @@ async function loadPlaylists() {
   }
 }
 
-// 解析并进入选歌（直接在当前 modal 内部进入解析与挑选，无需二次弹窗）
 function handleSelectTracksAndImport(playlist: RemotePlaylist) {
-  // 严格优先保证目标成员与当前云端账号绑定的飞牛成员一致
-  if (activeAccount.value?.owner_user) {
+  if (!props.currentUser?.isAdmin && props.currentUser?.username) {
+    targetType.value = 'user';
+    targetUser.value = props.currentUser.username;
+  } else if (activeAccount.value?.owner_user) {
     targetType.value = 'user';
     targetUser.value = activeAccount.value.owner_user;
   } else if (!targetUser.value && props.currentUser?.username) {
@@ -401,16 +459,17 @@ function handleSelectTracksAndImport(playlist: RemotePlaylist) {
   selectedPlaylistForImport.value = playlist;
 }
 
-// 快速直接一键导入
 async function handleQuickImport(playlist: RemotePlaylist) {
   if (!activeAccount.value) return;
   importingId.value = playlist.id;
   try {
     const targetId = activeAccount.value.id || activeAccount.value.provider;
+    const effectiveTarget = props.currentUser?.isAdmin ? targetType.value : 'user';
+    const effectiveUser = props.currentUser?.isAdmin ? targetUser.value : (props.currentUser?.username || targetUser.value);
     const result = await api.importMusicAccountPlaylist(targetId, {
       urls: [playlist.import_url],
-      target: targetType.value,
-      user: targetUser.value
+      target: effectiveTarget,
+      user: effectiveUser
     });
     if (!result.ok) throw new Error(result.error || result.message || '导入未能开始');
     showToast(`《${playlist.name}》已进入同步队列。`, 'success');
@@ -507,7 +566,7 @@ onBeforeUnmount(() => {
         <!-- 主内容区域 -->
         <div
           class="min-h-0 flex-1 flex flex-col"
-          :class="selectedPlaylistForImport ? 'overflow-hidden p-3 sm:p-5' : 'overflow-y-auto px-4 py-4 sm:px-6 sm:py-5'"
+          :class="selectedPlaylistForImport ? 'overflow-hidden p-3 sm:p-5' : 'overflow-y-auto custom-scrollbar px-4 py-4 sm:px-6 sm:py-5'"
         >
           <!-- 选歌确认视图 (直接复用 PlaylistImportConfirm，单 Modal 顺畅闭环) -->
           <PlaylistImportConfirm
@@ -520,6 +579,7 @@ onBeforeUnmount(() => {
             :default-target-type="targetType"
             :default-target-user="targetUser"
             :user-list="userList"
+            :current-user="currentUser"
             :show-back-button="true"
             @back="selectedPlaylistForImport = null; dailyRecommendPreview = null"
             @started="emit('started'); closeModal();"
@@ -530,24 +590,11 @@ onBeforeUnmount(() => {
           <div v-else-if="!activeAccount" class="space-y-4">
             <!-- 管理员切换筛选栏 -->
             <div v-if="currentUser?.isAdmin" class="flex items-center justify-between gap-3 border-b border-border/50 pb-3">
-              <div class="flex items-center gap-1.5 p-1 bg-muted/50 rounded-xl">
-                <button
-                  type="button"
-                  class="px-3 py-1 text-xs font-medium rounded-lg transition-all"
-                  :class="accountFilterTab === 'all' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
-                  @click="accountFilterTab = 'all'"
-                >
-                  全部成员绑定账号
-                </button>
-                <button
-                  type="button"
-                  class="px-3 py-1 text-xs font-medium rounded-lg transition-all"
-                  :class="accountFilterTab === 'my' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
-                  @click="accountFilterTab = 'my'"
-                >
-                  我的账号
-                </button>
-              </div>
+              <SpringTabs
+                v-model="accountFilterTab"
+                :items="accountFilterTabs"
+                size="sm"
+              />
             </div>
 
             <!-- 加载状态 -->
@@ -557,53 +604,55 @@ onBeforeUnmount(() => {
 
             <!-- 账号卡片网格 -->
             <div v-else class="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
-              <button
+              <Button
                 v-for="account in displayedAccounts"
                 :key="account.id"
                 type="button"
-                class="group relative flex flex-col justify-between h-auto min-h-[175px] w-full rounded-2xl border border-border/80 bg-card p-4 text-left transition-all hover:border-primary/40 hover:shadow-md hover:shadow-black/5 disabled:hover:translate-y-0 disabled:opacity-60"
+                variant="ghost"
+                class="group relative flex flex-col items-stretch justify-between h-auto min-h-[175px] w-full rounded-2xl border border-border/80 bg-card p-4 text-left whitespace-normal transition-all hover:border-primary/40 hover:bg-card hover:shadow-md hover:shadow-black/5 disabled:opacity-60"
                 :disabled="!account.available"
                 @click="chooseAccount(account)"
               >
                 <div>
                   <div class="flex items-start justify-between gap-2.5">
-                    <div class="flex items-center gap-2.5">
+                    <div class="flex items-center gap-2.5 min-w-0">
                       <img
-                        v-if="account.connected && account.avatar"
+                        v-if="account.connected && account.avatar && !brokenImageUrls.has(account.avatar)"
                         :src="account.avatar"
                         alt=""
-                        class="h-10 w-10 rounded-full border border-border/60 object-cover"
+                        class="h-10 w-10 shrink-0 rounded-full border border-border/60 object-cover"
                         referrerpolicy="no-referrer"
+                        @error="markImageBroken(account.avatar)"
                       />
-                      <span v-else class="grid h-10 w-10 place-items-center rounded-xl font-black text-xs border" :class="providerTone(account.provider)">
+                      <span v-else class="grid h-10 w-10 shrink-0 place-items-center rounded-xl font-black text-xs border" :class="providerTone(account.provider)">
                         {{ providerBadge(account.provider) }}
                       </span>
                       <div class="min-w-0">
                         <h3 class="text-sm font-bold text-foreground truncate">
                           {{ account.connected ? (account.nickname || account.name) : account.name }}
                         </h3>
-                        <p class="text-[11px] text-muted-foreground truncate">
+                        <p class="text-[11px] text-muted-foreground font-normal truncate">
                           {{ account.name }}
                         </p>
                       </div>
                     </div>
 
                     <!-- 状态标签 -->
-                    <div class="flex flex-col items-end gap-1">
-                      <span v-if="account.connected" class="flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                    <div class="flex flex-col items-end gap-1 shrink-0">
+                      <Badge v-if="account.connected" variant="success" class="gap-1 px-2 py-0.5 text-[10px]">
                         <Check class="h-3 w-3" />已连接
-                      </span>
-                      <span v-if="account.connected && account.daily_sync_enabled" class="flex items-center gap-1 rounded-full bg-amber-500/15 border border-amber-500/20 px-2 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                      </Badge>
+                      <Badge v-if="account.connected && account.daily_sync_enabled" variant="warning" class="gap-1 px-2 py-0.5 text-[10px]">
                         <Sparkles class="h-2.5 w-2.5" />自动日推
-                      </span>
-                      <span v-else-if="!account.available" class="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      </Badge>
+                      <Badge v-else-if="!account.available" variant="secondary" class="px-2 py-0.5 text-[10px]">
                         暂未开放
-                      </span>
+                      </Badge>
                     </div>
                   </div>
 
                   <!-- 提示或详细归属信息 -->
-                  <div class="mt-3.5 space-y-1">
+                  <div class="mt-3.5 space-y-1 font-normal">
                     <div v-if="currentUser?.isAdmin && account.connected" class="flex items-center gap-1.5 text-[11px] text-muted-foreground">
                       <UserRound class="h-3.5 w-3.5 text-primary/70 shrink-0" />
                       <span>所属成员：<strong class="text-foreground font-medium">{{ account.owner_user }}</strong></span>
@@ -624,43 +673,33 @@ onBeforeUnmount(() => {
                     {{ account.connected ? '浏览账号歌单' : (account.provider === 'netease' ? '扫码 / 连接' : '连接账号') }}
                   </span>
                 </div>
-              </button>
+              </Button>
             </div>
           </div>
 
           <!-- 未连接：登录绑定视图 -->
-          <div v-else-if="!activeAccount.connected" class="mx-auto max-w-xl space-y-4">
+          <div v-else-if="!activeAccount.connected" class="mx-auto max-w-xl space-y-4 w-full">
             <!-- 平台标题及模式切换 -->
-            <div class="flex items-center justify-between rounded-2xl border border-border/80 bg-card p-4">
-              <div class="flex items-center gap-3">
-                <span class="grid h-11 w-11 place-items-center rounded-2xl text-xs font-black border" :class="providerTone(activeAccount.provider)">
+            <div class="flex items-center justify-between gap-3 rounded-2xl border border-border/80 bg-card p-4">
+              <div class="flex items-center gap-3 min-w-0">
+                <span class="grid h-11 w-11 shrink-0 place-items-center rounded-2xl text-xs font-black border" :class="providerTone(activeAccount.provider)">
                   {{ providerBadge(activeAccount.provider) }}
                 </span>
-                <div>
-                  <h3 class="text-sm font-bold text-foreground">连接 {{ activeAccount.name }}</h3>
-                  <p class="mt-0.5 text-[11px] text-muted-foreground">凭据将绑定至当前登录成员：<span class="font-semibold text-foreground">{{ currentUser?.username || 'admin' }}</span></p>
+                <div class="min-w-0">
+                  <h3 class="text-sm font-bold text-foreground truncate">连接 {{ activeAccount.name }}</h3>
+                  <p class="mt-0.5 text-[11px] text-muted-foreground truncate">绑定账号：<span class="font-semibold text-foreground">{{ currentUser?.username || 'admin' }}</span></p>
                 </div>
               </div>
 
               <!-- 网易云支持扫码 / Cookie 切换 -->
-              <div v-if="activeAccount.provider === 'netease'" class="flex items-center p-1 bg-muted/60 rounded-xl">
-                <button
-                  type="button"
-                  class="px-2.5 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5"
-                  :class="loginMode === 'qr' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
-                  @click="loginMode = 'qr'; fetchNeteaseQr()"
-                >
-                  <Smartphone class="h-3.5 w-3.5" />扫码
-                </button>
-                <button
-                  type="button"
-                  class="px-2.5 py-1 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5"
-                  :class="loginMode === 'cookie' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
-                  @click="loginMode = 'cookie'; stopQrPoll()"
-                >
-                  <KeyRound class="h-3.5 w-3.5" />cookie
-                </button>
-              </div>
+              <SpringTabs
+                v-if="activeAccount.provider === 'netease'"
+                v-model="loginMode"
+                :items="loginModeTabs"
+                size="sm"
+                class="shrink-0"
+                @update:model-value="handleLoginModeChange"
+              />
             </div>
 
             <!-- 网易云：二维码扫码登录 -->
@@ -758,11 +797,12 @@ onBeforeUnmount(() => {
             <div class="flex flex-col gap-3.5 rounded-2xl border border-border/80 bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
               <div class="flex min-w-0 items-center gap-3">
                 <img
-                  v-if="activeAccount.avatar"
+                  v-if="activeAccount.avatar && !brokenImageUrls.has(activeAccount.avatar)"
                   :src="activeAccount.avatar"
                   alt=""
                   class="h-12 w-12 shrink-0 rounded-full border border-border/60 object-cover"
                   referrerpolicy="no-referrer"
+                  @error="markImageBroken(activeAccount.avatar)"
                 />
                 <span v-else class="grid h-12 w-12 shrink-0 place-items-center rounded-full border" :class="providerTone(activeAccount.provider)">
                   <UserRound class="h-6 w-6" />
@@ -770,7 +810,7 @@ onBeforeUnmount(() => {
                 <div class="min-w-0">
                   <div class="flex items-center gap-2">
                     <p class="truncate text-sm font-bold text-foreground">{{ activeAccount.nickname || activeAccount.name }}</p>
-                    <Badge variant="outline" class="text-[10px] px-1.5 py-0 h-4 border-emerald-500/30 text-emerald-600 dark:text-emerald-400">
+                    <Badge variant="success" class="text-[10px] px-1.5 py-0 h-4">
                       已就绪
                     </Badge>
                   </div>
@@ -801,9 +841,9 @@ onBeforeUnmount(() => {
             </div>
 
             <!-- 目标存储归属配置 -->
-            <div class="grid gap-3 rounded-2xl border border-border/60 bg-muted/20 p-3 sm:grid-cols-2">
+            <div v-if="currentUser?.isAdmin" class="grid gap-3 rounded-2xl border border-border/60 bg-muted/20 p-3 sm:grid-cols-2">
               <div class="space-y-1.5">
-                <label class="text-[10px] font-semibold text-muted-foreground">导入歌单权限</label>
+                <label class="text-[10px] font-semibold text-muted-foreground">导入歌单可见范围</label>
                 <Select v-model="targetType">
                   <SelectTrigger class="h-9 bg-card text-xs"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -836,8 +876,8 @@ onBeforeUnmount(() => {
                       <h4 class="text-sm font-bold text-foreground">每日推荐歌曲</h4>
                       <Badge
                         v-if="dailySyncEnabled"
-                        variant="secondary"
-                        class="text-[10px] font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25 px-2 py-0.5 rounded-full"
+                        variant="success"
+                        class="text-[10px] font-semibold px-2 py-0.5 rounded-full"
                       >
                         每天 {{ dailySyncTime || '04:00' }} 自动同步
                       </Badge>
@@ -855,32 +895,20 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <!-- 自动同步 Switch 开关 -->
-                <div class="flex items-center gap-2 shrink-0">
-                  <span class="text-xs font-medium text-muted-foreground hidden sm:inline">
-                    {{ dailySyncEnabled ? '已开启' : '已关闭' }}
-                  </span>
-                  <button
-                    type="button"
-                    role="switch"
-                    :aria-checked="dailySyncEnabled"
-                    class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    :class="dailySyncEnabled ? 'bg-primary' : 'bg-muted'"
-                    :disabled="savingDailySettings"
-                    @click="handleToggleDailySync(!dailySyncEnabled)"
-                  >
-                    <span
-                      class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-background shadow-lg ring-0 transition duration-200 ease-in-out"
-                      :class="dailySyncEnabled ? 'translate-x-5' : 'translate-x-0'"
-                    />
-                  </button>
-                </div>
+                <!-- 自动同步弹簧切换 -->
+                <SpringTabs
+                  v-model="dailySyncMode"
+                  :items="dailySyncModeTabs"
+                  size="sm"
+                  class="shrink-0"
+                />
               </div>
 
               <!-- 自动同步偏好详细配置 (开启时展示) -->
               <div
                 v-if="dailySyncEnabled"
-                class="grid gap-3 pt-3 border-t border-border/50 sm:grid-cols-2 lg:grid-cols-4 text-xs"
+                class="grid gap-3 pt-3 border-t border-border/50 sm:grid-cols-2 text-xs"
+                :class="currentUser?.isAdmin ? 'lg:grid-cols-4' : 'lg:grid-cols-3'"
               >
                 <!-- 同步时间 -->
                 <div class="space-y-1.5">
@@ -901,6 +929,7 @@ onBeforeUnmount(() => {
                   <Select v-model="dailySyncQuality" @update:model-value="handleSaveDailySettings">
                     <SelectTrigger class="h-8 bg-muted/20 text-xs"><SelectValue /></SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="flac24bit">Hi-Res (24-Bit)</SelectItem>
                       <SelectItem value="flac">FLAC (无损音质)</SelectItem>
                       <SelectItem value="320k">320K (高品质)</SelectItem>
                       <SelectItem value="128k">128K (标准品质)</SelectItem>
@@ -909,7 +938,7 @@ onBeforeUnmount(() => {
                 </div>
 
                 <!-- 目标歌单归属 -->
-                <div class="space-y-1.5">
+                <div v-if="currentUser?.isAdmin" class="space-y-1.5">
                   <label class="text-[10px] font-semibold text-muted-foreground">入库可见范围</label>
                   <Select v-model="dailySyncTarget" @update:model-value="handleSaveDailySettings">
                     <SelectTrigger class="h-8 bg-muted/20 text-xs"><SelectValue /></SelectTrigger>
@@ -942,14 +971,14 @@ onBeforeUnmount(() => {
                     <span>正在同步今日推荐歌曲中…</span>
                   </div>
                   <div v-else-if="activeAccount.last_daily_sync_at" class="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                    <span
-                      class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-medium text-[10px]"
-                      :class="activeAccount.last_daily_sync_status === 'success' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-destructive/10 text-destructive'"
+                    <Badge
+                      :variant="activeAccount.last_daily_sync_status === 'success' ? 'success' : 'destructive'"
+                      class="gap-1 px-1.5 py-0.5 rounded font-medium text-[10px]"
                     >
                       <CheckCircle2 v-if="activeAccount.last_daily_sync_status === 'success'" class="h-3 w-3" />
                       <AlertCircle v-else class="h-3 w-3" />
                       {{ activeAccount.last_daily_sync_status === 'success' ? '同步成功' : '同步失败' }}
-                    </span>
+                    </Badge>
                     <span>{{ formatSyncTime(activeAccount.last_daily_sync_at) }}</span>
                     <span v-if="activeAccount.last_daily_sync_message" class="text-muted-foreground/80 truncate max-w-xs sm:max-w-md">
                       · {{ activeAccount.last_daily_sync_message }}
@@ -1020,12 +1049,13 @@ onBeforeUnmount(() => {
                 <!-- 歌单封面 -->
                 <div class="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-muted border border-border/50">
                   <img
-                    v-if="playlist.cover"
+                    v-if="playlist.cover && !brokenImageUrls.has(playlist.cover)"
                     :src="playlist.cover"
                     :alt="playlist.name"
                     class="h-full w-full object-cover"
                     loading="lazy"
                     referrerpolicy="no-referrer"
+                    @error="markImageBroken(playlist.cover)"
                   />
                   <Music2 v-else class="absolute left-1/2 top-1/2 h-6 w-6 -translate-x-1/2 -translate-y-1/2 text-muted-foreground/40" />
                 </div>
@@ -1045,7 +1075,6 @@ onBeforeUnmount(() => {
 
                 <!-- 操作按钮组 -->
                 <div class="flex flex-col sm:flex-row items-end sm:items-center gap-1.5 shrink-0">
-                  <!-- 核心推荐：解析选歌 (复用 NewTaskModal) -->
                   <Button
                     variant="default"
                     size="sm"
@@ -1057,18 +1086,27 @@ onBeforeUnmount(() => {
                     <span>选歌</span>
                   </Button>
 
-                  <!-- 快捷操作：一键全选导入 -->
-                  <Button
-                    variant="secondary"
-                    size="icon"
-                    class="h-8 w-8"
-                    :disabled="!!importingId"
-                    :title="`一键导入整单`"
-                    @click="handleQuickImport(playlist)"
+                  <Popconfirm
+                    :title="`直接导入《${playlist.name}》？`"
+                    :description="`将整单 ${playlist.track_count} 首歌曲直接加入后台下载队列。`"
+                    confirm-text="立即导入"
+                    :danger="false"
+                    :loading="importingId === playlist.id"
+                    side="top"
+                    align="end"
+                    @confirm="handleQuickImport(playlist)"
                   >
-                    <Loader2 v-if="importingId === playlist.id" class="h-3.5 w-3.5 animate-spin" />
-                    <Download v-else class="h-3.5 w-3.5" />
-                  </Button>
+                    <Button
+                      variant="secondary"
+                      size="icon"
+                      class="h-8 w-8"
+                      :disabled="!!importingId"
+                      title="一键导入整单"
+                    >
+                      <Loader2 v-if="importingId === playlist.id" class="h-3.5 w-3.5 animate-spin" />
+                      <Download v-else class="h-3.5 w-3.5" />
+                    </Button>
+                  </Popconfirm>
                 </div>
               </article>
             </div>

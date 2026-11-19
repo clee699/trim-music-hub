@@ -1,0 +1,440 @@
+#!/bin/bash
+# Shared helper functions for TRIM Music Hub fnOS (.fpk) lifecycle scripts.
+
+set -o pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+APP_NAME="trim-music-hub"
+CONTAINER_NAME="trim-music-hub-fpk"
+COMPOSE_PROJECT="trim-music-hub-fpk"
+
+APPDEST="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
+APPVER="${TRIM_APPVER:-latest}"
+LOG_FILE="${PKGVAR}/fpk-lifecycle.log"
+CONF_FILE="${PKGVAR}/fpk_env.conf"
+COMPOSE_FILE="${PKGVAR}/docker-compose.yml"
+DATA_DIR="${PKGVAR}/data"
+SOCKET_FILE="${APPDEST}/trim-music-hub.sock"
+
+mkdir -p "${PKGVAR}" "${DATA_DIR}" 2>/dev/null || true
+
+log_info() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_err() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+fail_with_msg() {
+  local msg="$1"
+  log_err "${msg}"
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE}"
+  else
+    echo "${msg}" >&2
+  fi
+  exit 1
+}
+
+run_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"
+  else
+    fail_with_msg "未检测到 Docker Compose 组件，请先在飞牛应用中心安装并启用 Docker。"
+  fi
+}
+
+check_docker_ready() {
+  if ! command -v docker >/dev/null 2>&1; then
+    fail_with_msg "未检测到 Docker 命令，请先在飞牛应用中心安装 Docker。"
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    fail_with_msg "Docker 服务当前未运行，请先启动飞牛 Docker 服务后再试。"
+  fi
+}
+
+detect_fnos_db_dir() {
+  local candidates=(
+    "/var/apps/trim.music/var/db"
+    "/usr/local/apps/@appdata/trim.music/db"
+  )
+  local vol_dir
+  for vol_dir in /vol*/@appdata/trim.music/db; do
+    if [ -d "${vol_dir}" ]; then
+      candidates+=("${vol_dir}")
+    fi
+  done
+
+  local d
+  for d in "${candidates[@]}"; do
+    if [ -f "${d}/music.db" ]; then
+      readlink -f "${d}" 2>/dev/null || echo "${d}"
+      return 0
+    fi
+  done
+  for d in "${candidates[@]}"; do
+    if [ -d "${d}" ]; then
+      readlink -f "${d}" 2>/dev/null || echo "${d}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_fnos_cover_dir() {
+  local candidates=(
+    "/var/apps/trim.music/meta/cover"
+    "/usr/local/apps/@appmeta/trim.music/cover"
+  )
+  local vol_dir
+  for vol_dir in /vol*/@appmeta/trim.music/cover; do
+    if [ -d "${vol_dir}" ]; then
+      candidates+=("${vol_dir}")
+    fi
+  done
+
+  local d
+  for d in "${candidates[@]}"; do
+    if [ -d "${d}" ]; then
+      readlink -f "${d}" 2>/dev/null || echo "${d}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+load_saved_config() {
+  SAVED_PORT="4175"
+  SAVED_MUSIC_DIR="auto"
+  SAVED_DEFAULT_SOURCE="kw"
+  SAVED_RUNTIME_IMAGE=""
+
+  if [ -f "${CONF_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "${CONF_FILE}" 2>/dev/null || true
+  fi
+
+  CFG_PORT="${wizard_port:-${SAVED_PORT}}"
+  CFG_MUSIC_DIR="${wizard_music_dir:-${SAVED_MUSIC_DIR}}"
+  CFG_DEFAULT_SOURCE="${wizard_default_source:-${SAVED_DEFAULT_SOURCE}}"
+  RUNTIME_IMAGE="${SAVED_RUNTIME_IMAGE:-}"
+
+  if ! [[ "${CFG_PORT}" =~ ^[0-9]{2,5}$ ]] || [ "${CFG_PORT}" -lt 1 ] || [ "${CFG_PORT}" -gt 65535 ]; then
+    fail_with_msg "无效的服务端口号：${CFG_PORT}（需在 1-65535 之间）"
+  fi
+
+  case "${CFG_DEFAULT_SOURCE}" in
+    kw|kg|tx|wy|auto|custom) ;;
+    *) CFG_DEFAULT_SOURCE="kw" ;;
+  esac
+}
+
+save_config_file() {
+  python3 - "${CONF_FILE}" "${CFG_PORT}" "${CFG_MUSIC_DIR}" "${CFG_DEFAULT_SOURCE}" "${RUNTIME_IMAGE}" <<'PY'
+import shlex
+import sys
+
+conf_path, port, music_dir, source, image = sys.argv[1:6]
+lines = [
+    f"SAVED_PORT={shlex.quote(port)}",
+    f"SAVED_MUSIC_DIR={shlex.quote(music_dir)}",
+    f"SAVED_DEFAULT_SOURCE={shlex.quote(source)}",
+    f"SAVED_RUNTIME_IMAGE={shlex.quote(image)}",
+]
+with open(conf_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+}
+
+check_port_conflict() {
+  local port="$1"
+  # Ignore if our own container already holds this port
+  if docker inspect "${CONTAINER_NAME}" 2>/dev/null | grep -q '"Running": true'; then
+    if docker port "${CONTAINER_NAME}" 2>/dev/null | grep -q ":${port}$"; then
+      return 0
+    fi
+  fi
+  if python3 - "${port}" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("0.0.0.0", port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+sys.exit(0)
+PY
+  then
+    return 0
+  else
+    fail_with_msg "局域网端口 ${port} 已被其他服务占用，请在向导中更换为其他端口（如 4176）。"
+  fi
+}
+
+ensure_runtime_image() {
+  local force_refresh="${1:-0}"
+
+  if [ "${force_refresh}" != "1" ] && [ -n "${RUNTIME_IMAGE}" ]; then
+    if docker image inspect "${RUNTIME_IMAGE}" >/dev/null 2>&1; then
+      log_info "Reusing existing runtime image: ${RUNTIME_IMAGE}"
+      return 0
+    fi
+  fi
+
+  # 1. Offline bundled image tarball
+  local tar_gz="${APPDEST}/image/trim-music-hub-image.tar.gz"
+  local tar_raw="${APPDEST}/image/trim-music-hub-image.tar"
+  local tag_file="${APPDEST}/image/image-tag.txt"
+
+  if [ -f "${tar_gz}" ] || [ -f "${tar_raw}" ]; then
+    log_info "Loading bundled offline Docker image..."
+    local load_out=""
+    if [ -f "${tar_gz}" ]; then
+      load_out="$(gzip -dc "${tar_gz}" | docker load 2>&1)" || fail_with_msg "导入离线 Docker 镜像失败：${load_out}"
+    else
+      load_out="$(docker load -i "${tar_raw}" 2>&1)" || fail_with_msg "导入离线 Docker 镜像失败：${load_out}"
+    fi
+    log_info "docker load output: ${load_out}"
+    if [ -f "${tag_file}" ]; then
+      RUNTIME_IMAGE="$(head -n 1 "${tag_file}" | tr -d '[:space:]')"
+    fi
+    if [ -z "${RUNTIME_IMAGE}" ]; then
+      RUNTIME_IMAGE="$(echo "${load_out}" | sed -n 's/^Loaded image: //p' | tail -n 1 | tr -d '[:space:]')"
+    fi
+    if [ -n "${RUNTIME_IMAGE}" ] && docker image inspect "${RUNTIME_IMAGE}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  # 2. Online prebuilt registry image (GHCR / Docker Hub)
+  local ref_env="${APPDEST}/image-ref.env"
+  if [ -f "${ref_env}" ]; then
+    # shellcheck disable=SC1090
+    source "${ref_env}" 2>/dev/null || true
+    if [ -n "${IMAGE_REF:-}" ]; then
+      log_info "Pulling prebuilt image: ${IMAGE_REF}"
+      if docker pull "${IMAGE_REF}" >> "${LOG_FILE}" 2>&1; then
+        RUNTIME_IMAGE="${IMAGE_REF}"
+        return 0
+      fi
+      log_err "Failed to pull ${IMAGE_REF}; attempting local Dockerfile fallback if available."
+    fi
+  fi
+
+  # 3. Local Dockerfile build fallback (Universal Source FPK)
+  if [ -f "${APPDEST}/repo/Dockerfile" ]; then
+    local local_tag="trim-music-hub-fpk:${APPVER}"
+    log_info "Building runtime image locally from ${APPDEST}/repo -> ${local_tag}"
+    if docker build -t "${local_tag}" "${APPDEST}/repo" >> "${LOG_FILE}" 2>&1; then
+      RUNTIME_IMAGE="${local_tag}"
+      return 0
+    fi
+    fail_with_msg "本地构建运行镜像失败，请检查 NAS 网络连通性或改用内置离线镜像版 (.fpk) 安装包。"
+  fi
+
+  fail_with_msg "无法获取应用运行镜像，请检查网络连接或下载离线完整版 (.fpk) 安装包。"
+}
+
+prepare_and_render_compose() {
+  local sync_mode="${1:-start}"
+  local db_dir=""
+  db_dir="$(detect_fnos_db_dir)" || fail_with_msg "未检测到飞牛音乐（trim.music）数据库目录，请先打开「飞牛音乐」完成初始化后再试。"
+
+  local cover_dir=""
+  cover_dir="$(detect_fnos_cover_dir 2>/dev/null || true)"
+
+  if [ -z "${RUNTIME_IMAGE}" ]; then
+    ensure_runtime_image 0
+  fi
+
+  local py_err=""
+  py_err="$(python3 - "${db_dir}" "${cover_dir}" "${APPDEST}" "${DATA_DIR}" "${COMPOSE_FILE}" "${CONTAINER_NAME}" "${RUNTIME_IMAGE}" "${CFG_PORT}" "${CFG_MUSIC_DIR}" "${CFG_DEFAULT_SOURCE}" "${sync_mode}" 2>&1 <<'PY'
+import json
+import os
+import sqlite3
+import sys
+
+(
+    db_dir,
+    cover_dir,
+    appdest,
+    data_dir,
+    compose_file,
+    container_name,
+    runtime_image,
+    host_port,
+    cfg_music_dir,
+    cfg_source,
+    sync_mode,
+) = sys.argv[1:12]
+
+FORBIDDEN_PREFIXES = (
+    "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64",
+    "/proc", "/sys", "/dev", "/boot", "/root", "/run", "/var/apps"
+)
+
+
+def is_safe_music_path(p: str) -> bool:
+    if not p or not p.startswith("/") or ":" in p or "\n" in p or "\r" in p:
+        return False
+    norm = os.path.normpath(p)
+    if norm == "/" or ".." in p.split("/"):
+        return False
+    for bad in FORBIDDEN_PREFIXES:
+        if norm == bad or norm.startswith(bad + "/"):
+            return False
+    return True
+
+
+shared_dirs = []
+db_path = os.path.join(db_dir, "music.db")
+if os.path.isfile(db_path):
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='shared_library'")
+        if cur.fetchone():
+            cur.execute("SELECT path FROM shared_library")
+            for (raw_p,) in cur.fetchall():
+                if isinstance(raw_p, str):
+                    rp = os.path.realpath(raw_p.strip())
+                    if is_safe_music_path(rp) and os.path.isdir(rp) and rp not in shared_dirs:
+                        shared_dirs.append(rp)
+        conn.close()
+    except Exception:
+        pass
+
+primary_dir = ""
+cfg_clean = (cfg_music_dir or "").strip()
+if cfg_clean and cfg_clean.lower() != "auto":
+    if not is_safe_music_path(cfg_clean):
+        print(f"不安全的音乐目录路径：{cfg_clean}（请填写如 /vol1/1000/Music 的存储卷绝对路径）")
+        sys.exit(2)
+    os.makedirs(cfg_clean, exist_ok=True)
+    primary_dir = os.path.realpath(cfg_clean)
+else:
+    if shared_dirs:
+        primary_dir = shared_dirs[0]
+    elif os.path.isdir("/vol1/1000"):
+        primary_dir = "/vol1/1000/Music"
+        os.makedirs(primary_dir, exist_ok=True)
+    else:
+        primary_dir = os.path.join(data_dir, "music")
+        os.makedirs(primary_dir, exist_ok=True)
+
+mount_dirs = []
+for d in [primary_dir] + shared_dirs:
+    if d and d not in mount_dirs:
+        mount_dirs.append(d)
+
+# Update settings.json safely
+os.makedirs(data_dir, exist_ok=True)
+settings_path = os.path.join(data_dir, "settings.json")
+settings = {}
+if os.path.isfile(settings_path):
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                settings = loaded
+    except Exception:
+        settings = {}
+
+if sync_mode == "install" or not settings:
+    settings["download_dir"] = primary_dir
+    settings["download_source"] = cfg_source
+    settings["is_configured"] = True
+elif sync_mode == "config":
+    settings["download_source"] = cfg_source
+    if (cfg_clean and cfg_clean.lower() != "auto") or not settings.get("download_dir"):
+        settings["download_dir"] = primary_dir
+    settings["is_configured"] = True
+else:
+    if not settings.get("download_dir"):
+        settings["download_dir"] = primary_dir
+        settings["is_configured"] = True
+
+with open(settings_path, "w", encoding="utf-8") as f:
+    json.dump(settings, f, ensure_ascii=False, indent=2)
+
+volumes = [
+    f"{db_dir}:/app/db:rw",
+    f"{data_dir}:/app/data:rw",
+    f"{appdest}:/app/target:rw",
+    f"{primary_dir}:/media/music:rw",
+]
+if cover_dir and os.path.isdir(cover_dir):
+    volumes.append(f"{cover_dir}:/app/cover:rw")
+
+for mdir in mount_dirs:
+    if mdir != "/media/music":
+        volumes.append(f"{mdir}:{mdir}:rw")
+
+env_map = {
+    "TZ": "Asia/Shanghai",
+    "NODE_ENV": "production",
+    "PORT": "4175",
+    "HOST": "0.0.0.0",
+    "PUID": "1000",
+    "PGID": "1000",
+    "MUSIC_DIR": primary_dir,
+    "FNOS_DB_PATH": "/app/db/music.db",
+    "FNOS_COVER_DIR": "/app/cover",
+    "DATA_DIR": "/app/data",
+    "GATEWAY_SOCKET": "/app/target/trim-music-hub.sock",
+    "GATEWAY_PREFIX": "/app/trim-music-hub",
+    "FNOS_WS_URL": "ws://host.docker.internal:5666/websocket?type=main",
+}
+
+def yaml_str(val: str) -> str:
+    return json.dumps(str(val).replace("$", "$$"), ensure_ascii=False)
+
+
+lines = [
+    "services:",
+    "  trim-music-hub:",
+    f"    image: {yaml_str(runtime_image)}",
+    f"    container_name: {yaml_str(container_name)}",
+    "    restart: unless-stopped",
+    "    ports:",
+    f"      - {yaml_str(f'{host_port}:4175')}",
+    "    extra_hosts:",
+    '      - "host.docker.internal:host-gateway"',
+    "    environment:",
+]
+for k, v in env_map.items():
+    lines.append(f"      {k}: {yaml_str(v)}")
+lines.append("    volumes:")
+for vol in volumes:
+    lines.append(f"      - {yaml_str(vol)}")
+
+with open(compose_file, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+)" || fail_with_msg "${py_err:-生成容器编排配置失败}"
+}
+
+is_container_running() {
+  docker inspect "${CONTAINER_NAME}" 2>/dev/null | grep -q '"Status": "running"'
+}
+
+wait_for_service_ready() {
+  local i=0
+  while [ "${i}" -lt 20 ]; do
+    if is_container_running && [ -S "${SOCKET_FILE}" ]; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  is_container_running
+}

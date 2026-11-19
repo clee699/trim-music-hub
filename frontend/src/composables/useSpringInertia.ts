@@ -3,10 +3,12 @@ import { ref, onMounted, onUnmounted, nextTick, type Ref } from 'vue';
 export interface SpringInertiaOptions {
   /** 外部传入获取当前激活项索引的函数 */
   getActiveIndex: () => number;
+  /** 运动轴方向：默认水平 horizontal，侧边栏导航可设为 vertical */
+  orientation?: 'horizontal' | 'vertical';
   /** 是否在初始化后立即定位，不执行初始动效 */
   immediateOnInit?: boolean;
-  /** 样式更新自定义回调 (默认直接修改 sliderRef 的 transform 与 width) */
-  onApplyStyle?: (x: number, width: number, scaleX: number) => void;
+  /** 样式更新自定义回调 (默认直接修改 sliderRef 的 transform 与尺寸) */
+  onApplyStyle?: (pos: number, size: number, scale: number) => void;
 }
 
 interface RectCache {
@@ -37,6 +39,7 @@ export function useSpringInertia(
   options: SpringInertiaOptions
 ) {
   const isReady = ref(false);
+  const isVertical = options.orientation === 'vertical';
 
   // 物理弹簧模型状态 (供外部读取或诊断)
   const spring = {
@@ -60,10 +63,9 @@ export function useSpringInertia(
     if (!containerRef.value || !itemRefs.value.length) return;
     cachedRects = itemRefs.value.map(el => {
       if (!el) return { x: 0, width: 0 };
-      return {
-        x: el.offsetLeft,
-        width: el.offsetWidth,
-      };
+      return isVertical
+        ? { x: el.offsetTop, width: el.offsetHeight }
+        : { x: el.offsetLeft, width: el.offsetWidth };
     });
   }
 
@@ -71,10 +73,16 @@ export function useSpringInertia(
     const el = sliderRef.value;
     if (!el) return;
     if (Math.abs(width - lastAppliedWidth) >= 0.5) {
-      el.style.width = `${width.toFixed(1)}px`;
+      if (isVertical) {
+        el.style.height = `${width.toFixed(1)}px`;
+      } else {
+        el.style.width = `${width.toFixed(1)}px`;
+      }
       lastAppliedWidth = width;
     }
-    el.style.transform = `translate3d(${x.toFixed(2)}px, 0, 0) scaleX(${scaleX.toFixed(4)})`;
+    el.style.transform = isVertical
+      ? `translate3d(0, ${x.toFixed(2)}px, 0) scaleY(${scaleX.toFixed(4)})`
+      : `translate3d(${x.toFixed(2)}px, 0, 0) scaleX(${scaleX.toFixed(4)})`;
   }
 
   function applyStyle(x: number, width: number, scaleX: number) {
@@ -210,10 +218,13 @@ export function useSpringInertia(
         const { x, w, scaleX } = evaluateMotion(motionState, tSec);
         const kf: Keyframe = {
           offset: progress,
-          transform: `translate3d(${x.toFixed(2)}px, 0, 0) scaleX(${scaleX.toFixed(4)})`,
+          transform: isVertical
+            ? `translate3d(0, ${x.toFixed(2)}px, 0) scaleY(${scaleX.toFixed(4)})`
+            : `translate3d(${x.toFixed(2)}px, 0, 0) scaleX(${scaleX.toFixed(4)})`,
         };
         if (Math.abs(startW - targetWidth) >= 0.5) {
-          kf.width = `${w.toFixed(1)}px`;
+          if (isVertical) kf.height = `${w.toFixed(1)}px`;
+          else kf.width = `${w.toFixed(1)}px`;
         }
         keyframes.push(kf);
       }
@@ -221,8 +232,12 @@ export function useSpringInertia(
       // 保证最后一帧精确对齐目标
       keyframes[keyframes.length - 1] = {
         offset: 1,
-        transform: `translate3d(${targetX.toFixed(2)}px, 0, 0) scaleX(1.0000)`,
-        ...(Math.abs(startW - targetWidth) >= 0.5 ? { width: `${targetWidth.toFixed(1)}px` } : {}),
+        transform: isVertical
+          ? `translate3d(0, ${targetX.toFixed(2)}px, 0) scaleY(1.0000)`
+          : `translate3d(${targetX.toFixed(2)}px, 0, 0) scaleX(1.0000)`,
+        ...(Math.abs(startW - targetWidth) >= 0.5
+          ? (isVertical ? { height: `${targetWidth.toFixed(1)}px` } : { width: `${targetWidth.toFixed(1)}px` })
+          : {}),
       };
 
       try {
@@ -284,10 +299,12 @@ export function useSpringInertia(
       rect = cachedRects[activeIdx];
     }
 
-    const targetX = rect && rect.width > 0 ? rect.x : el.offsetLeft;
-    const targetWidth = rect && rect.width > 0 ? rect.width : el.offsetWidth;
+    const fallbackPos = isVertical ? el.offsetTop : el.offsetLeft;
+    const fallbackSize = isVertical ? el.offsetHeight : el.offsetWidth;
+    const targetX = rect && rect.width > 0 ? rect.x : fallbackPos;
+    const targetWidth = rect && rect.width > 0 ? rect.width : fallbackSize;
 
-    // 若容器处于 v-show 隐藏状态 (width === 0)，暂不更新，待容器显现时由 ResizeObserver 激活
+    // 若容器处于 v-show 隐藏状态 (size === 0)，暂不更新，待容器显现时由 ResizeObserver 激活
     if (targetWidth <= 0) return;
 
     if (immediate || !isReady.value) {
@@ -308,15 +325,20 @@ export function useSpringInertia(
       measureRects();
       updateIndicator(true);
       if (containerRef.value && typeof ResizeObserver !== 'undefined') {
+        let wasHidden = false;
         resizeObserver = new ResizeObserver((entries) => {
           const entry = entries[0];
-          const newWidth = entry?.contentRect?.width ?? 0;
-          // 若容器处于 v-show 隐藏 (width === 0)，坚决不触碰 DOM，杜绝切换 Tab 时的强制回流
-          if (newWidth <= 0) return;
+          const newSize = isVertical
+            ? (entry?.contentRect?.height ?? 0)
+            : (entry?.contentRect?.width ?? 0);
+          if (newSize <= 0) {
+            wasHidden = true;
+            return;
+          }
 
-          // 仅在宽度发生实质变化 (如窗口缩放、横竖屏切换) 时重新测量定位
-          if (Math.abs(newWidth - lastContainerWidth) >= 1) {
-            lastContainerWidth = newWidth;
+          if (wasHidden || Math.abs(newSize - lastContainerWidth) >= 1) {
+            wasHidden = false;
+            lastContainerWidth = newSize;
             measureRects();
             updateIndicator(true);
           }

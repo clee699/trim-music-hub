@@ -1,0 +1,14 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common"
+
+log_info "Running uninstall_callback (mode=${wizard_uninstall_data:-keep})..."
+
+if [ "${wizard_uninstall_data:-keep}" = "purge" ]; then
+  if [ -n "${PKGVAR}" ] && [[ "${PKGVAR}" == *"/trim-music-hub"* ]]; then
+    rm -rf "${PKGVAR:?}/data" "${CONF_FILE}" "${COMPOSE_FILE}" "${LOG_FILE}" 2>/dev/null || true
+  fi
+fi
+
+exit 0

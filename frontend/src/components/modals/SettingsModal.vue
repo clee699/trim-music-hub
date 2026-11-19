@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { api } from '../../api';
 import { showToast } from '../../composables/useToast';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Popconfirm } from '@/components/ui/popconfirm';
+import { SpringTabs, type SpringTabItem } from '@/components/ui/tabs';
 import {
   Dialog,
   DialogContent,
@@ -53,7 +54,6 @@ const emit = defineEmits<{
   (e: 'logout'): void;
 }>();
 
-// 导航层级：root (一级设置列表), directory (保存位置二级操作), source (下载音源二级操作), concurrency (并发下载二级操作), transcode (强制转码策略), about (系统状态二级页面)
 type SettingsLevel = 'root' | 'directory' | 'source' | 'concurrency' | 'transcode' | 'about';
 const currentLevel = ref<SettingsLevel>('root');
 const transitionName = ref<'slide-left' | 'slide-right'>('slide-left');
@@ -77,7 +77,7 @@ const concurrentDownloads = ref<number>(5);
 const forceTranscode = ref<boolean>(false);
 const transcodeQuality = ref<'flac' | '320k' | '128k'>('320k');
 const downloadDir = ref<string>('');
-const isConfigured = ref<boolean>(true);
+const originalDownloadDir = ref<string>('');
 const authorizedDirs = ref<AuthorizedDirectory[]>([]);
 const isLoadingDirs = ref<boolean>(false);
 const customDirInput = ref<string>('');
@@ -90,6 +90,29 @@ const dirVerifyResult = ref<{
 } | null>(null);
 const isVerifyingDir = ref<boolean>(false);
 const isTaskRunning = ref<boolean>(false);
+
+const concurrencyPresetTabs: SpringTabItem<number>[] = [
+  { value: 1, label: '1 首' },
+  { value: 3, label: '3 首' },
+  { value: 5, label: '5 首 · 推荐' },
+  { value: 8, label: '8 首' },
+  { value: 10, label: '10 首' },
+];
+
+type TranscodeMode = 'passthrough' | 'transcode';
+const transcodeModeTabs: SpringTabItem<TranscodeMode>[] = [
+  { value: 'passthrough', label: '直通免转码' },
+  { value: 'transcode', label: '向下转码' },
+];
+const transcodeMode = computed<TranscodeMode>({
+  get: () => (forceTranscode.value ? 'transcode' : 'passthrough'),
+  set: (val) => {
+    const next = val === 'transcode';
+    if (next !== forceTranscode.value) {
+      toggleForceTranscode(next);
+    }
+  },
+});
 
 async function checkTaskRunning() {
   try {
@@ -124,6 +147,7 @@ const customConfig = ref({
 const isSaving = ref(false);
 
 async function loadDirectories() {
+  if (!props.currentUser?.isAdmin) return;
   isLoadingDirs.value = true;
   try {
     const res = await api.getAuthorizedDirectories();
@@ -138,6 +162,7 @@ async function loadDirectories() {
 }
 
 async function verifyCustomDirectory(targetPath: string) {
+  if (!props.currentUser?.isAdmin) return;
   if (!targetPath.trim()) {
     dirVerifyResult.value = null;
     return;
@@ -186,7 +211,10 @@ function selectDirectory(d: AuthorizedDirectory) {
 
 async function loadSettings() {
   try {
-    await Promise.all([loadDirectories(), checkTaskRunning()]);
+    await Promise.all([
+      props.currentUser?.isAdmin ? loadDirectories() : Promise.resolve(),
+      checkTaskRunning()
+    ]);
     const res = await api.getSettings();
     if (res.ok && res.data) {
       currentSource.value = res.data.download_source || 'kw';
@@ -196,11 +224,10 @@ async function loadSettings() {
         transcodeQuality.value = res.data.transcode_quality as any;
       }
       downloadDir.value = res.data.download_dir || '';
+      originalDownloadDir.value = downloadDir.value;
       customDirInput.value = downloadDir.value;
-      isConfigured.value = res.data.is_configured ?? false;
 
-      // 首次安装或尚未设置下载路径：自动预选第一个可写且授权的目录
-      if (!downloadDir.value && authorizedDirs.value.length > 0) {
+      if (props.currentUser?.isAdmin && !downloadDir.value && authorizedDirs.value.length > 0) {
         const defaultWritable = authorizedDirs.value.find(d => d.writable && d.is_fnos_authorized) || authorizedDirs.value.find(d => d.writable);
         if (defaultWritable) {
           selectDirectory(defaultWritable);
@@ -219,7 +246,7 @@ async function loadSettings() {
         };
       }
 
-      if (downloadDir.value) {
+      if (props.currentUser?.isAdmin && downloadDir.value) {
         verifyCustomDirectory(downloadDir.value);
       }
     }
@@ -228,16 +255,18 @@ async function loadSettings() {
 
 async function handleSave() {
   if (!props.currentUser?.isAdmin) {
-    showToast('权限不足：仅管理员可以修改系统设置。', 'error');
+    showToast('无法修改系统设置', 'error');
     return;
   }
 
-  if (isTaskRunning.value) {
-    showToast('当前有任务正在执行或排队中，禁止修改下载目录！', 'warning');
+  const nextDir = downloadDir.value.trim();
+  const isChangingDir = nextDir !== originalDownloadDir.value;
+  if (isTaskRunning.value && isChangingDir) {
+    showToast('当前有任务正在执行或排队中，暂无法切换保存目录', 'warning');
     return;
   }
 
-  if (!downloadDir.value.trim()) {
+  if (!nextDir) {
     showToast('请先选择一个可用的音乐保存目录。', 'warning');
     navigateTo('directory');
     return;
@@ -255,28 +284,31 @@ async function handleSave() {
     return;
   }
 
+  const clampedConcurrency = Math.min(10, Math.max(1, Number(concurrentDownloads.value) || 5));
+  concurrentDownloads.value = clampedConcurrency;
+
   isSaving.value = true;
   try {
     const res = await api.updateSettings(
       currentSource.value,
       customConfig.value,
-      downloadDir.value.trim(),
+      isChangingDir ? nextDir : undefined,
       true,
-      concurrentDownloads.value,
+      clampedConcurrency,
       forceTranscode.value,
       transcodeQuality.value
     );
     if (res.ok) {
+      originalDownloadDir.value = nextDir;
       showToast('设置已保存。', 'success');
-      emit('updated', currentSource.value, downloadDir.value.trim());
+      emit('updated', currentSource.value, nextDir);
       if (props.isFirstInstall) {
-        emit('close');
-        emit('update:open', false);
+        handleOpenUpdate(false);
       } else {
         navigateBack();
       }
     } else {
-      showToast('设置保存失败', 'error');
+      showToast(res.error || '设置保存失败', 'error');
     }
   } catch (e: any) {
     showToast(`保存失败： ${e.message}`, 'error');
@@ -292,18 +324,14 @@ function handleOpenUpdate(val: boolean) {
 
 watch(() => props.open, (val) => {
   if (val) {
-    if (props.isFirstInstall) {
+    if (props.isFirstInstall && props.currentUser?.isAdmin) {
       currentLevel.value = 'directory';
     } else {
       currentLevel.value = 'root';
     }
     loadSettings();
   }
-});
-
-onMounted(() => {
-  loadSettings();
-});
+}, { immediate: true });
 
 const selectedSource = computed(() =>
   availableSources.value.find(source => source.id === currentSource.value)
@@ -354,10 +382,7 @@ const transcodeQualityLabel = computed(() => {
 });
 
 async function toggleForceTranscode(val: boolean) {
-  if (!props.currentUser?.isAdmin) {
-    showToast('权限不足：仅管理员可以修改系统设置。', 'error');
-    return;
-  }
+  if (!props.currentUser?.isAdmin) return;
   forceTranscode.value = val;
   try {
     const res = await api.updateSettings(
@@ -370,7 +395,7 @@ async function toggleForceTranscode(val: boolean) {
       transcodeQuality.value
     );
     if (res.ok) {
-      showToast(val ? `已开启强制音频转码（目标格式: ${transcodeQualityLabel.value}）` : '已关闭强制转码，启用原生直通免转码模式（推荐）', 'success');
+      showToast(val ? `已开启强制音频转码（目标格式: ${transcodeQualityLabel.value}）` : '已关闭强制转码，启用原生直通免转码模式', 'success');
     }
   } catch (e: any) {
     showToast(`切换转码模式失败：${e.message}`, 'error');
@@ -378,10 +403,7 @@ async function toggleForceTranscode(val: boolean) {
 }
 
 async function selectTranscodeQuality(quality: 'flac' | '320k' | '128k') {
-  if (!props.currentUser?.isAdmin) {
-    showToast('权限不足：仅管理员可以修改系统设置。', 'error');
-    return;
-  }
+  if (!props.currentUser?.isAdmin) return;
   transcodeQuality.value = quality;
   try {
     const res = await api.updateSettings(
@@ -417,8 +439,9 @@ const pageSubtitle = computed(() => {
     case 'directory': return '管理新下载歌曲、歌词与封面的存储位置';
     case 'source': return '切换或配置在线音乐解析与下载线路';
     case 'concurrency': return '调整歌单同步时多首歌同时下载的线程数';
+    case 'transcode': return '配置下载音频的原生直通或向下转码策略';
     case 'about': return 'TRIM Music Hub 服务底座与存储状态';
-    default: return '管理歌曲下载目录、音源线路及系统参数';
+    default: return '管理音乐平台绑定、系统参数与运行状态';
   }
 });
 </script>
@@ -481,11 +504,11 @@ const pageSubtitle = computed(() => {
                     <div class="flex items-center gap-2">
                       <span class="text-sm font-bold text-foreground truncate">{{ props.currentUser.username }}</span>
                       <Badge :variant="props.currentUser.isAdmin ? 'brand' : 'secondary'" class="text-[10px] px-2 py-0.5">
-                        {{ props.currentUser.isAdmin ? '管理员' : '普通成员' }}
+                        {{ props.currentUser.isAdmin ? '管理员' : '成员' }}
                       </Badge>
                     </div>
                     <p class="mt-0.5 text-[11px] text-muted-foreground truncate">
-                      {{ props.currentUser.isAdmin ? '具备全量系统配置与曲库管理权限' : '具备搜歌、下载与个人歌单管理权限' }}
+                      已连接飞牛系统账号
                     </p>
                   </div>
                 </div>
@@ -503,15 +526,15 @@ const pageSubtitle = computed(() => {
               </div>
             </div>
             <!-- 分组 1: 核心下载与存储 -->
-            <div>
+            <div v-if="props.currentUser?.isAdmin">
               <div class="px-1 mb-1.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
                 核心偏好
               </div>
               <div class="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/60 shadow-sm">
-                <!-- 保存位置列表项 -->
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="navigateTo('directory')"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -521,11 +544,11 @@ const pageSubtitle = computed(() => {
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-foreground">保存位置</span>
-                        <span v-if="compactDownloadDir" class="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                        <Badge v-if="compactDownloadDir" variant="success" class="px-2 py-0.5 text-[10px]">
                           {{ compactDownloadDir }}
-                        </span>
+                        </Badge>
                       </div>
-                      <p class="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate font-mono text-[11px] text-muted-foreground font-normal">
                         {{ downloadDir || '尚未配置保存目录' }}
                       </p>
                     </div>
@@ -534,12 +557,12 @@ const pageSubtitle = computed(() => {
                     <span v-if="dirVerifyResult?.writable" class="hidden sm:inline-block text-[11px] text-success font-medium">可写</span>
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
 
-                <!-- 下载音源列表项 -->
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="navigateTo('source')"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -549,11 +572,11 @@ const pageSubtitle = computed(() => {
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-foreground">下载音源</span>
-                        <span class="rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-600 dark:text-violet-400">
+                        <Badge variant="brand" class="px-2 py-0.5 text-[10px]">
                           {{ selectedSourceName }}
-                        </span>
+                        </Badge>
                       </div>
-                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground font-normal">
                         {{ selectedSourceDesc }}
                       </p>
                     </div>
@@ -561,12 +584,12 @@ const pageSubtitle = computed(() => {
                   <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
 
-                <!-- 同时下载数量设置 -->
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="navigateTo('concurrency')"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -576,11 +599,11 @@ const pageSubtitle = computed(() => {
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-foreground">同时下载歌曲数</span>
-                        <span class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400 font-mono">
+                        <Badge variant="warning" class="px-2 py-0.5 text-[10px] font-mono">
                           {{ concurrentDownloads }} 首同时下载
-                        </span>
+                        </Badge>
                       </div>
-                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground font-normal">
                         歌单同步时多任务并发抓取加速，默认 5 首
                       </p>
                     </div>
@@ -588,12 +611,12 @@ const pageSubtitle = computed(() => {
                   <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
 
-                <!-- 强制音频转码策略 -->
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="navigateTo('transcode')"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -603,14 +626,11 @@ const pageSubtitle = computed(() => {
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-foreground">强制音频转码</span>
-                        <span
-                          class="rounded-full px-2 py-0.5 text-[10px] font-semibold font-mono"
-                          :class="forceTranscode ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' : 'bg-success/15 text-success'"
-                        >
+                        <Badge :variant="forceTranscode ? 'warning' : 'success'" class="px-2 py-0.5 text-[10px] font-mono">
                           {{ forceTranscode ? `已开启 (${transcodeQualityLabel})` : '已关闭 (直通免转码)' }}
-                        </span>
+                        </Badge>
                       </div>
-                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground font-normal">
                         {{ forceTranscode ? `仅将高于 ${transcodeQualityLabel} 的音频向下转码，低品质自动跳过` : '关闭即原生直通模式，保留下载音源原始格式与音质' }}
                       </p>
                     </div>
@@ -618,7 +638,7 @@ const pageSubtitle = computed(() => {
                   <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -628,9 +648,10 @@ const pageSubtitle = computed(() => {
                 云端同步
               </div>
               <div class="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/60 shadow-sm">
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="openAccountsModal"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -642,7 +663,7 @@ const pageSubtitle = computed(() => {
                         <span class="text-sm font-bold text-foreground">音乐平台账号</span>
                         <Badge variant="outline" class="h-4 px-1.5 text-[9px]">网易云 · QQ</Badge>
                       </div>
-                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground font-normal">
                         绑定第三方音乐平台，同步自建歌单与我喜欢
                       </p>
                     </div>
@@ -650,7 +671,7 @@ const pageSubtitle = computed(() => {
                   <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -660,9 +681,10 @@ const pageSubtitle = computed(() => {
                 关于与运行
               </div>
               <div class="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/60 shadow-sm">
-                <button
+                <Button
                   type="button"
-                  class="w-full flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  variant="ghost"
+                  class="w-full h-auto rounded-none flex items-center justify-between p-3.5 sm:p-4 text-left hover:bg-muted/40 active:bg-muted/60"
                   @click="navigateTo('about')"
                 >
                   <div class="flex items-center gap-3.5 min-w-0 pr-2">
@@ -672,11 +694,11 @@ const pageSubtitle = computed(() => {
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
                         <span class="text-sm font-bold text-foreground">关于与系统状态</span>
-                        <span class="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                        <Badge variant="brand" class="px-2 py-0.5 text-[10px]">
                           v2.0.2
-                        </span>
+                        </Badge>
                       </div>
-                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground">
+                      <p class="mt-0.5 truncate text-[11px] text-muted-foreground font-normal">
                         飞牛 NAS 容器生产部署 · 数据库直连
                       </p>
                     </div>
@@ -684,7 +706,7 @@ const pageSubtitle = computed(() => {
                   <div class="flex items-center gap-1.5 shrink-0 text-muted-foreground">
                     <ChevronRight class="h-4 w-4 opacity-60" />
                   </div>
-                </button>
+                </Button>
               </div>
             </div>
           </div>
@@ -718,14 +740,15 @@ const pageSubtitle = computed(() => {
 
               <!-- 飞牛授权目录单选列表 -->
               <div class="space-y-2">
-                <button
+                <Button
                   v-for="d in authorizedDirs"
                   :key="d.path"
                   type="button"
+                  variant="ghost"
                   :disabled="isTaskRunning"
-                  class="flex w-full items-start justify-start gap-3 rounded-2xl border p-3.5 text-left transition-all active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  class="flex h-auto w-full items-start justify-start gap-3 rounded-2xl border p-3.5 text-left whitespace-normal active:scale-[0.99]"
                   :class="[
-                    downloadDir === d.path ? 'border-primary/60 bg-primary/10 shadow-sm' : 'border-border bg-card hover:bg-muted/45',
+                    downloadDir === d.path ? 'border-primary/60 bg-primary/10 shadow-sm hover:bg-primary/15' : 'border-border bg-card hover:bg-muted/45',
                     isTaskRunning ? 'opacity-60 cursor-not-allowed' : ''
                   ]"
                   @click="selectDirectory(d)"
@@ -737,12 +760,12 @@ const pageSubtitle = computed(() => {
                     <FolderCheck v-if="d.is_fnos_authorized" class="h-4 w-4" />
                     <FolderOpen v-else class="h-4 w-4" />
                   </span>
-                  <span class="min-w-0 flex-1">
+                  <span class="min-w-0 flex-1 font-normal">
                     <span class="flex flex-wrap items-center gap-1.5">
                       <strong class="text-xs text-foreground font-semibold">{{ d.name }}</strong>
-                      <span v-if="d.is_fnos_authorized" class="rounded-full bg-primary/15 px-1.5 py-0.5 text-[9px] font-semibold text-primary">飞牛曲库</span>
-                      <span v-if="d.writable" class="rounded-full bg-success/15 px-1.5 py-0.5 text-[9px] font-semibold text-success">可写入</span>
-                      <span v-else class="rounded-full bg-destructive/15 px-1.5 py-0.5 text-[9px] font-semibold text-destructive">不可写</span>
+                      <Badge v-if="d.is_fnos_authorized" variant="brand" class="px-1.5 py-0.5 text-[9px]">飞牛曲库</Badge>
+                      <Badge v-if="d.writable" variant="success" class="px-1.5 py-0.5 text-[9px]">可写入</Badge>
+                      <Badge v-else variant="destructive" class="px-1.5 py-0.5 text-[9px]">不可写</Badge>
                     </span>
                     <span class="mt-1 block break-all font-mono text-[10px] leading-4 text-muted-foreground">{{ d.path }}</span>
                     <span class="mt-0.5 block text-[10px] text-muted-foreground">约 {{ d.file_count }} 个音频文件</span>
@@ -753,7 +776,7 @@ const pageSubtitle = computed(() => {
                   >
                     <Check v-if="downloadDir === d.path" class="h-3 w-3 stroke-[3]" />
                   </span>
-                </button>
+                </Button>
 
                 <div v-if="isLoadingDirs" class="flex min-h-20 items-center justify-center gap-2 rounded-2xl border border-dashed border-border text-xs text-muted-foreground">
                   <Loader2 class="h-4 w-4 animate-spin text-primary" />正在读取飞牛授权目录…
@@ -779,7 +802,7 @@ const pageSubtitle = computed(() => {
                 <Input
                   v-model="customDirInput"
                   :disabled="isTaskRunning"
-                  placeholder="例如：/vol1/1000/Music 或自定义曲库绝对路径"
+                  placeholder="输入音乐曲库目录绝对路径"
                   class="h-10 min-w-0 flex-1 bg-card font-mono text-[11px]"
                   @keyup.enter="verifyCustomDirectory(customDirInput)"
                 />
@@ -830,12 +853,13 @@ const pageSubtitle = computed(() => {
               </div>
 
               <div class="grid grid-cols-2 gap-2.5">
-                <button
+                <Button
                   v-for="src in availableSources"
                   :key="src.id"
                   type="button"
-                  class="relative h-auto min-h-[112px] flex flex-col justify-start rounded-2xl border p-3 text-left transition-all active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                  :class="currentSource === src.id ? 'border-primary/60 bg-primary/10 shadow-sm' : 'border-border bg-card hover:bg-muted/45'"
+                  variant="ghost"
+                  class="relative h-auto min-h-[112px] flex flex-col items-stretch justify-start rounded-2xl border p-3 text-left whitespace-normal active:scale-[0.98]"
+                  :class="currentSource === src.id ? 'border-primary/60 bg-primary/10 shadow-sm hover:bg-primary/15' : 'border-border bg-card hover:bg-muted/45'"
                   @click="currentSource = src.id"
                 >
                   <span class="flex items-start justify-between gap-2 w-full">
@@ -853,10 +877,10 @@ const pageSubtitle = computed(() => {
                     </span>
                   </span>
                   <strong class="mt-3 block truncate text-xs text-foreground font-semibold">{{ src.name }}</strong>
-                  <span class="mt-1 line-clamp-2 block text-[10px] leading-4 text-muted-foreground">{{ src.desc }}</span>
+                  <span class="mt-1 line-clamp-2 block text-[10px] leading-4 text-muted-foreground font-normal">{{ src.desc }}</span>
                   <span v-if="src.id === 'kw'" class="absolute bottom-2.5 right-3 text-[9px] font-semibold text-primary">推荐默认</span>
                   <span v-else-if="src.id === 'auto'" class="absolute bottom-2.5 right-3 text-[9px] font-semibold text-primary">自动回退</span>
-                </button>
+                </Button>
               </div>
             </div>
 
@@ -918,23 +942,14 @@ const pageSubtitle = computed(() => {
                 </div>
               </div>
 
-              <!-- 预设选择按钮 -->
-              <div class="grid grid-cols-5 gap-2 pt-1">
-                <button
-                  v-for="num in [1, 3, 5, 8, 10]"
-                  :key="num"
-                  type="button"
-                  class="flex flex-col items-center justify-center rounded-xl border py-2.5 transition-all active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  :class="[
-                    concurrentDownloads === num
-                      ? 'border-amber-500/60 bg-amber-500/15 text-amber-600 dark:text-amber-400 font-bold shadow-sm'
-                      : 'border-border bg-muted/40 hover:bg-muted/70 text-foreground'
-                  ]"
-                  @click="concurrentDownloads = num"
-                >
-                  <span class="text-base font-mono leading-none">{{ num }}</span>
-                  <span class="text-[10px] text-muted-foreground mt-1">{{ num === 1 ? '单任务' : num === 5 ? '推荐' : `${num}并发` }}</span>
-                </button>
+              <!-- 预设选择胶囊 -->
+              <div class="pt-1">
+                <SpringTabs
+                  v-model="concurrentDownloads"
+                  :items="concurrencyPresetTabs"
+                  size="sm"
+                  full-width
+                />
               </div>
 
               <!-- 自定义输入 -->
@@ -968,30 +983,22 @@ const pageSubtitle = computed(() => {
           <!-- 5. 二级菜单：强制音频转码 (Transcode Level) -->
           <div v-else-if="currentLevel === 'transcode'" key="transcode" class="space-y-4">
             <div class="rounded-2xl border border-border/80 bg-card p-4 space-y-4 shadow-sm">
-              <div class="flex items-center justify-between gap-3">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div class="flex items-center gap-3">
                   <div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-violet-500/10 text-violet-500">
                     <Cpu class="h-5 w-5" />
                   </div>
                   <div>
                     <h4 class="text-sm font-bold text-foreground">强制音频转码</h4>
-                    <p class="text-xs text-muted-foreground">关闭开关即为直通免转码；开启后仅将高于目标品质的音频向下转码</p>
+                    <p class="text-xs text-muted-foreground">直通模式保留原格式；开启转码后仅将高于目标品质的音频向下转码</p>
                   </div>
                 </div>
-                <!-- 开关胶囊 -->
-                <button
-                  type="button"
-                  role="switch"
-                  :aria-checked="forceTranscode"
-                  class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                  :class="forceTranscode ? 'bg-primary' : 'bg-muted'"
-                  @click="toggleForceTranscode(!forceTranscode)"
-                >
-                  <span
-                    class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-background shadow-lg ring-0 transition duration-200 ease-in-out"
-                    :class="forceTranscode ? 'translate-x-5' : 'translate-x-0'"
-                  />
-                </button>
+                <SpringTabs
+                  v-model="transcodeMode"
+                  :items="transcodeModeTabs"
+                  size="sm"
+                  class="shrink-0"
+                />
               </div>
 
               <!-- 当前状态提示条 -->
@@ -1016,17 +1023,18 @@ const pageSubtitle = computed(() => {
                   <span class="text-[10px] text-muted-foreground">仅支持高品质 → 低品质单向转码</span>
                 </div>
                 <div class="space-y-2" :class="!forceTranscode ? 'opacity-65' : ''">
-                  <button
+                  <Button
                     v-for="opt in transcodeQualityOptions"
                     :key="opt.id"
                     type="button"
-                    class="w-full rounded-xl border p-3 text-left transition-all flex items-start justify-between gap-3"
+                    variant="ghost"
+                    class="w-full h-auto rounded-xl border p-3 text-left whitespace-normal flex items-start justify-between gap-3"
                     :class="transcodeQuality === opt.id
-                      ? 'border-primary bg-primary/10 shadow-xs'
+                      ? 'border-primary bg-primary/10 shadow-sm hover:bg-primary/15'
                       : 'border-border/70 bg-muted/20 hover:bg-muted/40'"
                     @click="selectTranscodeQuality(opt.id)"
                   >
-                    <div class="space-y-1 min-w-0 flex-1">
+                    <div class="space-y-1 min-w-0 flex-1 font-normal">
                       <div class="flex items-center gap-2">
                         <span class="text-xs font-bold text-foreground">{{ opt.name }}</span>
                         <Badge variant="outline" class="text-[9px] h-4 px-1.5" :class="transcodeQuality === opt.id ? 'border-primary/50 text-primary' : ''">
@@ -1043,7 +1051,7 @@ const pageSubtitle = computed(() => {
                     >
                       <Check v-if="transcodeQuality === opt.id" class="h-3 w-3 stroke-[3]" />
                     </div>
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>
@@ -1054,9 +1062,9 @@ const pageSubtitle = computed(() => {
                 <span>转码规则说明</span>
               </div>
               <p class="text-[11px] leading-5">
-                • <strong>关闭即直通</strong>：不设单独直通选项，关闭上方转码开关即为原生直通模式，直接保存音源原格式。<br>
-                • <strong>仅高转低</strong>：只从高品质向低品质转码（例如下载 FLAC 转 MP3），绝不存在 MP3 转成 FLAC 的反向升频。<br>
-                • <strong>智能跳过</strong>：若下载品质低于或等于所选目标（例如下载的是 MP3 且开启了转码 FLAC），将自动跳过该歌曲转码。
+                • <strong>直通免转码</strong>：直接保存音源原格式与采样率。<br>
+                • <strong>仅高转低</strong>：只从高品质向低品质转码（例如下载 FLAC 转 MP3），不执行 MP3 转 FLAC 的反向升频。<br>
+                • <strong>智能跳过</strong>：若下载品质低于或等于所选目标，自动跳过该歌曲转码。
               </p>
             </div>
           </div>
@@ -1114,14 +1122,14 @@ const pageSubtitle = computed(() => {
           <div class="hidden min-w-0 max-w-[270px] sm:block">
             <p class="text-[9px] text-muted-foreground">当前有效配置</p>
             <p class="truncate font-mono text-[10px] text-foreground/75">
-              {{ selectedSourceName }} · {{ compactDownloadDir || '未选目录' }}
+              {{ selectedSourceName }} · {{ compactDownloadDir || '默认目录' }}
             </p>
           </div>
           <div class="flex w-full sm:w-auto justify-end gap-2">
             <Button
               variant="outline"
               class="h-10 w-full sm:w-auto px-5 text-xs font-semibold"
-              @click="emit('close')"
+              @click="handleOpenUpdate(false)"
             >
               完成
             </Button>
@@ -1141,14 +1149,13 @@ const pageSubtitle = computed(() => {
             </Button>
 
             <Button
-              v-if="currentLevel !== 'about'"
+              v-if="currentLevel !== 'about' && props.currentUser?.isAdmin"
               class="h-10 gap-1.5 px-5 font-semibold text-xs min-w-[100px]"
-              :disabled="isSaving || !props.currentUser?.isAdmin"
-              :title="!props.currentUser?.isAdmin ? '仅管理员可修改系统配置' : ''"
+              :disabled="isSaving"
               @click="handleSave"
             >
               <Loader2 v-if="isSaving" class="h-3.5 w-3.5 animate-spin" />
-              <span>{{ !props.currentUser?.isAdmin ? '仅管理员可修改' : (isSaving ? '保存中…' : (props.isFirstInstall ? '完成配置' : '保存更改')) }}</span>
+              <span>{{ isSaving ? '保存中…' : (props.isFirstInstall ? '完成配置' : '保存更改') }}</span>
             </Button>
           </div>
         </template>

@@ -1,0 +1,21 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common"
+
+log_info "Running config_callback..."
+check_docker_ready
+load_saved_config
+check_port_conflict "${CFG_PORT}"
+
+ensure_runtime_image 0
+save_config_file
+prepare_and_render_compose "config"
+
+if ! run_compose up -d --remove-orphans >> "${LOG_FILE}" 2>&1; then
+  fail_with_msg "应用新配置重启容器失败，请检查端口占用或目录路径是否合法。"
+fi
+
+wait_for_service_ready || true
+log_info "config_callback completed successfully."
+exit 0

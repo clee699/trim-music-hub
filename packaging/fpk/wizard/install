@@ -1,0 +1,67 @@
+[
+  {
+    "stepTitle": "基础运行配置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "自动关联飞牛音乐曲库与封面目录；安装后支持从飞牛桌面窗口直接进入，也可通过局域网端口访问。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "局域网服务端口",
+        "initValue": "4175",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入服务端口号"
+          },
+          {
+            "pattern": "^([1-9][0-9]{3,4})$",
+            "message": "请输入 1024-65535 之间的有效端口号"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_music_dir",
+        "label": "默认音乐下载目录（填写 auto 自动匹配飞牛音乐媒体库）",
+        "initValue": "auto",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写 auto 或以 / 开头的绝对路径（如 /vol1/1000/Music）"
+          }
+        ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_default_source",
+        "label": "默认下载音源",
+        "initValue": "kw",
+        "options": [
+          {
+            "label": "酷我音乐（高品质 FLAC · 推荐）",
+            "value": "kw"
+          },
+          {
+            "label": "酷狗音乐",
+            "value": "kg"
+          },
+          {
+            "label": "QQ 音乐",
+            "value": "tx"
+          },
+          {
+            "label": "网易云音乐",
+            "value": "wy"
+          },
+          {
+            "label": "多源自动优选",
+            "value": "auto"
+          }
+        ]
+      }
+    ]
+  }
+]

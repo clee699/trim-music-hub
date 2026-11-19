@@ -18,7 +18,25 @@
 
 ---
 
-## 🛠️ 必须配置的 2 个核心目录
+## 📦 方式零：飞牛 fnOS `.fpk` 安装包一键安装（推荐 · 桌面图标 + 免密单点登录）
+
+通过飞牛应用中心「手动安装」`.fpk` 安装包，无需手动编写任何目录映射与环境变量，自动完成「飞牛音乐 (`trim.music`)」曲库与封面缓存绑定，并在飞牛桌面生成原生应用图标与多成员免密单点登录（兼容飞牛 FN Connect 远程访问与局域网端口双入口）：
+
+1. 确保已在飞牛「应用中心」安装并打开过一次官方 **「飞牛音乐」**（完成媒体库添加）以及 **「Docker」**。
+2. 前往本项目 **GitHub Releases** 下载对应架构的安装包（x86 设备推荐 `trim-music-hub-<version>-amd64.fpk` 离线完整版；ARM 设备推荐 `-arm64.fpk`），或在本地自行打包：
+   ```bash
+   # 构建通用源码版 .fpk（无需本地 Docker Buildx）
+   ./packaging/fpk/build.sh --mode source
+
+   # 或构建纯离线内置镜像版 .fpk（amd64 / arm64）
+   ./packaging/fpk/build.sh --mode bundle --arch amd64
+   ```
+   > 完整多模式打包与 GitHub Actions 自动发版说明详见 [`packaging/fpk/README.md`](packaging/fpk/README.md)。
+3. 打开飞牛 **「应用中心」 -> 「手动安装」**，选择 `.fpk` 文件，按向导确认端口（默认 `4175`）与默认音源后即可从飞牛桌面直接打开 **TRIM Music Hub**！
+
+---
+
+## 🛠️ 手动容器部署必须配置的 2 个核心目录
 
 | 配置项 | 容器内固定路径 | 宿主机对应路径说明 |
 | :--- | :--- | :--- |
@@ -90,8 +108,8 @@ services:
       - /vol1/1000/Music:/media/music:rw
       # 【无需修改】飞牛官方音乐应用数据库目录
       - /usr/local/apps/@appdata/trim.music/db:/app/db:rw
-      # 飞牛音乐已刮削封面缓存（只读）
-      - /vol1/@appmeta/trim.music/cover:/app/cover:ro
+      # 飞牛音乐封面缓存目录（读写，用于复用刮削封面与导入歌单封面）
+      - /vol1/@appmeta/trim.music/cover:/app/cover:rw
       # 数据持久化目录
       - ./data:/app/data:rw
 ```

@@ -1,0 +1,16 @@
+appname               = trim-music-hub
+version               = @VERSION@
+display_name          = TRIM Music Hub
+desc                  = 飞牛音乐全能管理中枢：支持网易云/QQ音乐歌单导入、多音源无损搜索下载、歌单直通同步与曲库去重治理。
+platform              = @PLATFORM@
+source                = thirdparty
+maintainer            = @MAINTAINER@
+distributor           = @MAINTAINER@
+maintainer_url        = @MAINTAINER_URL@
+os_min_version        = 1.1.3100
+install_dep_apps      = trim.music
+desktop_uidir         = ui
+desktop_applaunchname = trim-music-hub.main
+service_port          = 4175
+checkport             = false
+ctl_stop              = true

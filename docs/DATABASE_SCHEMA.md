@@ -66,7 +66,7 @@ FNOS_DB_PATH=./data/mock_music.db node --watch server.mjs
 
 | 表名 | 核心用途 | 关键字段与关联说明 |
 | :--- | :--- | :--- |
-| **`user`** | **飞牛音乐用户表** | `id` (PK), `guid` (UNIQUE), `name` (用户名，如 `948049716` / `admin`), `name_latin_full`, `password`, `role` (`admin`=管理员, `member`=普通用户), `created_by` (`oauth`=NAS统一授权, `manual`=手动创建), `status` (`active`=正常, `deleted`=已删除), `shared_library_access_mode` (`none` / `all` / `custom`), `last_accessed_at` |
+| **`user`** | **飞牛音乐用户表** | `id` (PK), `guid` (UNIQUE), `name` (用户名，如 `member` / `admin`), `name_latin_full`, `password`, `role` (`admin`=管理员, `member`=普通用户), `created_by` (`oauth`=NAS统一授权, `manual`=手动创建), `status` (`active`=正常, `deleted`=已删除), `shared_library_access_mode` (`none` / `all` / `custom`), `last_accessed_at` |
 | **`user_oauth`** | **NAS 统一账号绑定表** | `id` (PK), `user_id` (FK -> `user.id`), `user_deleted` (`0`/`1`), `oauth_provider` (固定如 `trim-nas`), `oauth_user_id` (NAS 底层 UID), `oauth_user_name` |
 | **`user_token`** | **多端登录会话 Token 表** | `id` (PK), `user_id` (FK -> `user.id`), `token` (UNIQUE), `device_id` (设备标识), `expired_at`, `is_auth_login` |
 | **`shared_library`** | **音乐媒体库文件夹配置** | `id` (PK), `guid` (UNIQUE), `path` (UNIQUE 物理挂载目录，如 `/vol2/1000/媒体/音乐`), `metadata_preference`, `auto_download_lyric` (`1`=自动下载歌词), `content_last_changed_at` |

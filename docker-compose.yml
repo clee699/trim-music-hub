@@ -28,8 +28,8 @@ services:
       # 2. 飞牛音乐官方 SQLite 数据库挂载 (【必填】：飞牛官方音乐应用数据库目录)
       - ${FNOS_DB_DIR:-/usr/local/apps/@appdata/trim.music/db}:/app/db:rw
 
-      # 3. 飞牛音乐已刮削封面缓存（只读）
-      - ${FNOS_COVER_DIR:-/vol1/@appmeta/trim.music/cover}:/app/cover:ro
+      # 3. 飞牛音乐封面缓存目录（读写，支持读取已刮削封面与导入歌单高清封面）
+      - ${FNOS_COVER_DIR:-/vol1/@appmeta/trim.music/cover}:/app/cover:rw
 
       # 4. 本地持久化数据 (导入历史、任务状态缓存)
       - ./data:/app/data:rw

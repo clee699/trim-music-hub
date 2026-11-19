@@ -1,0 +1,15 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common"
+
+log_info "Running upgrade_init..."
+check_docker_ready
+
+if [ -f "${COMPOSE_FILE}" ]; then
+  run_compose down --remove-orphans >> "${LOG_FILE}" 2>&1 || true
+fi
+docker rm -f "${CONTAINER_NAME}" >> "${LOG_FILE}" 2>&1 || true
+rm -f "${SOCKET_FILE}" 2>/dev/null || true
+
+exit 0

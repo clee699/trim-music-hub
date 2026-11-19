@@ -24,7 +24,6 @@ import {
   StopCircle,
   Layers,
   ChevronDown,
-  User,
   Copy,
   Play,
   Loader2,
@@ -42,7 +41,16 @@ const emit = defineEmits<{
   (e: 'open-task-modal'): void;
   (e: 'stop-task'): void;
   (e: 'refresh-queue'): void;
+  (e: 'clear-logs'): void;
 }>();
+
+const brokenCoverUrls = ref<Set<string>>(new Set());
+function markCoverBroken(url?: string) {
+  if (!url) return;
+  const next = new Set(brokenCoverUrls.value);
+  next.add(url);
+  brokenCoverUrls.value = next;
+}
 
 // Filter & View State
 type QueueFilter = 'all' | 'active' | 'completed';
@@ -155,6 +163,14 @@ const currentTrackOrder = computed(() => {
 // 曲目明细筛选
 type TrackFilter = 'all' | 'downloading' | 'downloaded' | 'reused' | 'failed';
 const trackFilter = ref<TrackFilter>('all');
+
+const trackFilterTabs: SpringTabItem<TrackFilter>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'downloading', label: '进行中' },
+  { value: 'downloaded', label: '已入库' },
+  { value: 'reused', label: '复用' },
+  { value: 'failed', label: '失败' },
+];
 
 const filteredRunningTracks = computed(() => {
   const tracks = props.task.tracks || [];
@@ -461,29 +477,31 @@ watch(() => props.logs.length, () => {
         <div class="flex items-center gap-2.5 sm:gap-3 min-w-0">
           <div class="relative h-10 w-10 sm:h-11 sm:w-11 shrink-0 rounded-lg overflow-hidden border border-primary/40 bg-muted grid place-items-center">
             <img
-              v-if="runningTaskDetails.cover"
+              v-if="runningTaskDetails.cover && !brokenCoverUrls.has(runningTaskDetails.cover)"
               :src="runningTaskDetails.cover"
               class="h-full w-full object-cover select-none pointer-events-none"
               alt="封面"
+              @error="markCoverBroken(runningTaskDetails.cover)"
             />
             <RefreshCw v-else class="h-5 w-5 text-primary animate-spin" />
           </div>
 
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-              <Badge variant="brand" class="text-[10px] py-0 px-1.5 h-4.5 gap-1 shrink-0">
+              <Badge variant="brand" class="text-[10px] py-0 px-1.5 h-[18px] gap-1 shrink-0">
                 <span class="inline-block h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
                 {{ props.task.status === 'downloading' ? '下载中' : (props.task.status === 'parsing' ? '解析中' : (props.task.status === 'finalizing' ? '入库中' : '正在执行')) }}
               </Badge>
               <h3 class="text-xs sm:text-sm font-bold text-foreground truncate max-w-[160px] sm:max-w-md">
                 {{ runningTaskDetails.title }}
               </h3>
-              <span
+              <Badge
                 v-if="runningTaskDetails.speed"
-                class="text-[10px] font-mono font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-full shrink-0 flex items-center gap-1 animate-pulse"
+                variant="brand"
+                class="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full shrink-0 gap-1 animate-pulse"
               >
                 ⚡ {{ runningTaskDetails.speed }}
-              </span>
+              </Badge>
             </div>
             <p class="mt-0.5 text-[11px] text-muted-foreground truncate font-mono flex items-center gap-1.5">
               <span class="truncate">{{ runningTaskDetails.step }}</span>
@@ -536,12 +554,13 @@ watch(() => props.logs.length, () => {
         <!-- 1. 当前进行中的具体单曲实时卡片 -->
         <div class="rounded-xl border border-primary/25 bg-primary/5 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div class="flex items-center gap-3 min-w-0">
-            <div class="relative h-12 w-12 shrink-0 rounded-lg overflow-hidden border border-primary/30 bg-muted/80 shadow-xs flex items-center justify-center">
+            <div class="relative h-12 w-12 shrink-0 rounded-lg overflow-hidden border border-primary/30 bg-muted/80 shadow-sm flex items-center justify-center">
               <img
-                v-if="runningTaskDetails.currentTrack?.cover"
+                v-if="runningTaskDetails.currentTrack?.cover && !brokenCoverUrls.has(runningTaskDetails.currentTrack.cover)"
                 :src="runningTaskDetails.currentTrack.cover"
                 class="h-full w-full object-cover"
                 alt="当前歌曲封面"
+                @error="markCoverBroken(runningTaskDetails.currentTrack?.cover)"
               />
               <Disc3 v-else class="h-6 w-6 text-primary animate-spin" />
               <div class="absolute inset-0 bg-primary/10 flex items-center justify-center pointer-events-none">
@@ -617,48 +636,11 @@ watch(() => props.logs.length, () => {
               <span class="text-[10px] text-muted-foreground font-mono">({{ runningTaskDetails.tracks.length }} 首)</span>
             </div>
 
-            <div class="flex items-center gap-1 text-[10px]">
-              <button
-                type="button"
-                class="px-2 py-0.5 rounded transition-colors"
-                :class="trackFilter === 'all' ? 'bg-primary text-primary-foreground font-semibold' : 'text-muted-foreground hover:bg-muted'"
-                @click="trackFilter = 'all'"
-              >
-                全部
-              </button>
-              <button
-                type="button"
-                class="px-2 py-0.5 rounded transition-colors"
-                :class="trackFilter === 'downloading' ? 'bg-primary text-primary-foreground font-semibold' : 'text-muted-foreground hover:bg-muted'"
-                @click="trackFilter = 'downloading'"
-              >
-                进行中
-              </button>
-              <button
-                type="button"
-                class="px-2 py-0.5 rounded transition-colors"
-                :class="trackFilter === 'downloaded' ? 'bg-primary text-primary-foreground font-semibold' : 'text-muted-foreground hover:bg-muted'"
-                @click="trackFilter = 'downloaded'"
-              >
-                已入库
-              </button>
-              <button
-                type="button"
-                class="px-2 py-0.5 rounded transition-colors"
-                :class="trackFilter === 'reused' ? 'bg-primary text-primary-foreground font-semibold' : 'text-muted-foreground hover:bg-muted'"
-                @click="trackFilter = 'reused'"
-              >
-                复用
-              </button>
-              <button
-                type="button"
-                class="px-2 py-0.5 rounded transition-colors"
-                :class="trackFilter === 'failed' ? 'bg-primary text-primary-foreground font-semibold' : 'text-muted-foreground hover:bg-muted'"
-                @click="trackFilter = 'failed'"
-              >
-                失败
-              </button>
-            </div>
+            <SpringTabs
+              v-model="trackFilter"
+              :items="trackFilterTabs"
+              size="sm"
+            />
           </div>
 
           <div class="max-h-56 overflow-y-auto rounded-lg border border-border/80 bg-background/60 divide-y divide-border/50 custom-scrollbar">
@@ -693,7 +675,7 @@ watch(() => props.logs.length, () => {
               <div class="shrink-0 flex items-center gap-1.5">
                 <Badge
                   :variant="getTrackStatusBadge(tr.status).variant"
-                  class="text-[10px] py-0 px-1.5 h-4.5 gap-1 font-medium"
+                  class="text-[10px] py-0 px-1.5 h-[18px] gap-1 font-medium"
                 >
                   <component
                     :is="getTrackStatusBadge(tr.status).icon"
@@ -772,10 +754,11 @@ watch(() => props.logs.length, () => {
 
               <div class="relative h-10 w-10 sm:h-11 sm:w-11 shrink-0 rounded-lg overflow-hidden border border-border/80 bg-muted grid place-items-center">
                 <img
-                  v-if="task.cover"
+                  v-if="task.cover && !brokenCoverUrls.has(task.cover)"
                   :src="task.cover"
                   class="h-full w-full object-cover select-none pointer-events-none"
                   alt="封面"
+                  @error="markCoverBroken(task.cover)"
                 />
                 <component
                   :is="task.type === 'single' ? Music2 : ListMusic"
@@ -790,12 +773,13 @@ watch(() => props.logs.length, () => {
               <!-- 第一行：序号 + 标题 + 状态徽章 -->
               <div class="flex items-center justify-between gap-2">
                 <div class="flex items-center gap-1.5 min-w-0 flex-1">
-                  <span
+                  <Badge
                     v-if="task.order"
-                    class="text-[10px] font-mono font-bold text-muted-foreground bg-muted/80 px-1 py-0.2 rounded shrink-0"
+                    variant="secondary"
+                    class="text-[10px] font-mono font-bold px-1 py-0.5 h-4 rounded shrink-0"
                   >
                     #{{ task.order }}
-                  </span>
+                  </Badge>
                   <h4 class="truncate text-xs sm:text-sm font-semibold text-foreground">
                     {{ task.title }}
                   </h4>
@@ -831,12 +815,13 @@ watch(() => props.logs.length, () => {
                 <span v-if="task.total > 0" class="text-primary font-semibold">
                   进度 {{ getTaskProcessed(task) }}/{{ task.total }}
                 </span>
-                <span
+                <Badge
                   v-if="getTaskLiveSpeed(task)"
-                  class="text-primary font-bold bg-primary/10 px-1.5 py-0.2 rounded animate-pulse"
+                  variant="brand"
+                  class="text-[10px] font-bold px-1.5 py-0.5 h-4 rounded animate-pulse"
                 >
                   ⚡ {{ getTaskLiveSpeed(task) }}
-                </span>
+                </Badge>
               </div>
 
               <!-- 第三行：时间/当前歌曲提示 + 右侧操作按钮组 -->
@@ -889,7 +874,7 @@ watch(() => props.logs.length, () => {
                     v-if="task.status === 'stopped' || task.status === 'failed'"
                     variant="outline"
                     size="sm"
-                    class="h-7 px-2 text-xs gap-1 font-semibold text-primary border-primary/40 bg-primary/10 hover:bg-primary/20 active:scale-95 transition-all shadow-xs"
+                    class="h-7 px-2 text-xs gap-1 font-semibold text-primary border-primary/40 bg-primary/10 hover:bg-primary/20 active:scale-95 transition-all shadow-sm"
                     title="从中断位置继续下载"
                     :disabled="resumingTaskId === task.id"
                     @click="handleResumeTask(task)"
@@ -957,10 +942,11 @@ watch(() => props.logs.length, () => {
               <div class="flex items-center gap-2.5 min-w-0">
                 <div class="relative h-9 w-9 shrink-0 rounded overflow-hidden border border-primary/30 bg-muted grid place-items-center">
                   <img
-                    v-if="getTaskCurrentTrack(task)?.cover"
+                    v-if="getTaskCurrentTrack(task)?.cover && !brokenCoverUrls.has(getTaskCurrentTrack(task)!.cover!)"
                     :src="getTaskCurrentTrack(task)!.cover"
                     class="h-full w-full object-cover"
                     alt="当前单曲"
+                    @error="markCoverBroken(getTaskCurrentTrack(task)?.cover)"
                   />
                   <Disc3 v-else class="h-5 w-5 text-primary animate-spin" />
                 </div>
@@ -976,9 +962,9 @@ watch(() => props.logs.length, () => {
               </div>
 
               <div v-if="getTaskLiveSpeed(task)" class="shrink-0 text-right">
-                <span class="text-[10px] font-mono font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-full">
+                <Badge variant="brand" class="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full">
                   ⚡ {{ getTaskLiveSpeed(task) }}
-                </span>
+                </Badge>
               </div>
             </div>
 
@@ -1037,14 +1023,24 @@ watch(() => props.logs.length, () => {
           <span class="text-[10px] font-mono text-muted-foreground">共 {{ logs.length }} 行</span>
         </div>
         <div class="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            class="h-6 px-2 text-[10px] text-muted-foreground hover:text-foreground"
-            @click="logs.length = 0"
+          <Popconfirm
+            v-if="logs.length > 0"
+            title="清空实时日志？"
+            description="将清空当前终端运行日志记录。"
+            confirmText="清空日志"
+            :danger="false"
+            side="bottom"
+            align="end"
+            @confirm="emit('clear-logs')"
           >
-            清空显示
-          </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-6 px-2 text-[10px] text-muted-foreground hover:text-foreground"
+            >
+              清空日志
+            </Button>
+          </Popconfirm>
           <Button
             variant="ghost"
             size="sm"

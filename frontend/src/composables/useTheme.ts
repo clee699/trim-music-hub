@@ -21,15 +21,19 @@ function initTheme() {
   if (initialized || typeof window === 'undefined') return;
   initialized = true;
   mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-  const saved = window.localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
-  if (saved === 'system' || saved === 'light' || saved === 'dark') mode.value = saved;
+  try {
+    const saved = window.localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
+    if (saved === 'system' || saved === 'light' || saved === 'dark') mode.value = saved;
+  } catch {}
   mediaQuery.addEventListener('change', resolveTheme);
   resolveTheme();
 }
 
 function setTheme(next: ThemeMode) {
   mode.value = next;
-  window.localStorage.setItem(STORAGE_KEY, next);
+  try {
+    window.localStorage.setItem(STORAGE_KEY, next);
+  } catch {}
   resolveTheme();
 }
 

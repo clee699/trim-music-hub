@@ -12,13 +12,7 @@ const delegatedProps = reactiveOmit(props, "class")
 const forwarded = useForwardPropsEmits(delegatedProps, emits)
 
 function handleOpenAutoFocus(event: Event) {
-  if (typeof window !== "undefined") {
-    // 触控设备或移动视口下彻底禁止打开时自动聚焦，防止键盘遮挡
-    const isTouchOrMobile = window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches;
-    if (isTouchOrMobile) {
-      event.preventDefault();
-    }
-  }
+  event.preventDefault();
 }
 </script>
 <template>

@@ -20,7 +20,7 @@ interface Props {
   inDialog?: boolean;
 }
 
-const props = withDefaults(defineProps<Props>(), {
+withDefaults(defineProps<Props>(), {
   unit: '项',
   cancelText: '取消',
   actionText: '删除',

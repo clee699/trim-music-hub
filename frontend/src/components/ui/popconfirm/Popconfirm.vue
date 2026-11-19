@@ -41,7 +41,8 @@ watch(
     if (val !== undefined) {
       isOpen.value = val;
     }
-  }
+  },
+  { immediate: true }
 );
 
 function onOpenChange(val: boolean) {
@@ -54,6 +55,10 @@ function onOpenChange(val: boolean) {
 
 function handleConfirm() {
   emit('confirm');
+  if (props.open === undefined && !props.loading) {
+    isOpen.value = false;
+    emit('update:open', false);
+  }
 }
 
 function handleCancel() {

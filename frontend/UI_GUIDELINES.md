@@ -70,7 +70,7 @@
   - 核心底层 Composable：`@/composables/useSpringInertia.ts`
 - **使用要求**：
   - 项目内所有横向 Tab 栏、分段选择器（Segmented Control）、分类筛选药丸、设置子选项卡等，均必须使用 `<SpringTabs>` 或接入 `useSpringInertia`；
-  - 滑块背景统一采用纯平磨砂设计（如 `bg-card shadow-sm` 或 `bg-primary/12 border border-primary/25`），杜绝粗糙边缘，通过硬件加速提供媲美 iOS/macOS 级别的原生触控跟手质感。
+  - 滑块背景统一采用纯平磨砂设计（如 `bg-card shadow-sm` 或 `bg-primary/[0.12] border border-primary/25`），杜绝粗糙边缘，通过硬件加速提供媲美 iOS/macOS 级别的原生触控跟手质感。
 
 ---
 
